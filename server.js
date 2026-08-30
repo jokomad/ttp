@@ -757,14 +757,38 @@ async function updateTrailingStop(symbol, currentPrice) {
 
     if (trade.trail_direction === 'long') {
         // ── Long trail ──────────────────────────────────────────────
-        if (currentPrice > (trade.trail_peak || 0)) {
-            // New peak — advance the trailing SL upward
-            const profitPct = trade.long_entry > 0 ? (currentPrice - trade.long_entry) / trade.long_entry : 0;
-            const baseDist  = trade.trail_distance || TRAIL_INITIAL_PCT;
-            // Tighten to ~60% of base distance once profit exceeds 1.5x base distance
-            const trailDist = profitPct >= (baseDist * 1.5) ? Math.max(baseDist * 0.6, TRAIL_TIGHT_PCT) : baseDist;
-            const newSL     = parseFloat((Math.floor(currentPrice * (1 - trailDist) / tickSize) * tickSize).toFixed(dec));
+        const profitPct = trade.long_entry > 0 ? (currentPrice - trade.long_entry) / trade.long_entry : 0;
+        const baseDist  = trade.trail_distance || 0.012; // default 1.2% wide leash
+        
+        let targetSL = 0;
+        let trailDist = baseDist;
 
+        // Stage 3: Mega-Run (> 3.0% profit) — Tighten leash to 0.6% behind peak
+        if (profitPct >= 0.030) {
+            trailDist = Math.max(baseDist * 0.5, 0.006);
+            targetSL = currentPrice * (1 - trailDist);
+        }
+        // Stage 2: Net Profit Lock (> 1.5% profit) — Guarantee minimum +1.0% exit to beat the cut loss
+        else if (profitPct >= 0.015) {
+            const minGuaranteed = trade.long_entry * 1.010; // Entry + 1.0%
+            const trailingCalc  = currentPrice * (1 - baseDist);
+            targetSL = Math.max(minGuaranteed, trailingCalc);
+        }
+        // Stage 1: Break-Even Arming (> 0.8% profit) — Lock SL at Break-Even + fee buffer
+        else if (profitPct >= 0.008) {
+            const breakevenSL   = trade.long_entry * 1.001; // Entry + 0.1% buffer
+            const trailingCalc  = currentPrice * (1 - baseDist);
+            targetSL = Math.max(breakevenSL, trailingCalc);
+        }
+        // Normal wide trailing
+        else {
+            targetSL = currentPrice * (1 - baseDist);
+        }
+
+        const newSL = parseFloat((Math.floor(targetSL / tickSize) * tickSize).toFixed(dec));
+
+        if (currentPrice > (trade.trail_peak || 0)) {
+            // New peak — record peak and advance SL
             if (!trade.trail_sl || newSL > trade.trail_sl) {
                 if (!lastTrailUpdate[symbol] || now - lastTrailUpdate[symbol] >= 500) {
                     lastTrailUpdate[symbol] = now;
@@ -772,15 +796,25 @@ async function updateTrailingStop(symbol, currentPrice) {
                         .run(currentPrice, newSL, trailDist, symbol);
                     emitPdTradeUpdate(symbol);
                     syncFromSQLite(db, 'pump_dump_trades', symbol);
-                    console.log(`\x1b[32m[Trail] Long: peak=${currentPrice.toFixed(4)}, SL=${newSL} (dist=${(trailDist*100).toFixed(2)}%, profit=${(profitPct*100).toFixed(2)}%)\x1b[0m`);
+                    console.log(`\x1b[32m[Trail] Long: Peak=${currentPrice.toFixed(4)}, SL=${newSL} (Profit=${(profitPct*100).toFixed(2)}%, Trail=${(trailDist*100).toFixed(2)}%)\x1b[0m`);
                 }
+            }
+        } else if (!trade.trail_sl || newSL > trade.trail_sl) {
+            // Ratchet SL upward even between peaks if stage upgrade occurs
+            if (!lastTrailUpdate[symbol] || now - lastTrailUpdate[symbol] >= 500) {
+                lastTrailUpdate[symbol] = now;
+                db.prepare('UPDATE pump_dump_trades SET trail_sl=?, trail_distance=? WHERE symbol=?')
+                    .run(newSL, trailDist, symbol);
+                emitPdTradeUpdate(symbol);
+                syncFromSQLite(db, 'pump_dump_trades', symbol);
+                console.log(`\x1b[32m[Trail] Long SL Ratcheted: SL=${newSL} (Profit=${(profitPct*100).toFixed(2)}%)\x1b[0m`);
             }
         } else if (trade.trail_sl && currentPrice <= trade.trail_sl) {
             // ✅ Trail SL hit — close tradeQty of long reduce-only
             trailClosingFlags[symbol] = true;
             console.log(`[PD] Long trail SL hit @ ${currentPrice.toFixed(4)} (SL was ${trade.trail_sl}). Closing ${tradeQty} long...`);
             db.prepare('UPDATE pump_dump_trades SET status=? WHERE symbol=?').run('closing', symbol);
-            syncFromSQLite(db, 'pump_dump_trades', symbol);  // persist 'closing' state immediately
+            syncFromSQLite(db, 'pump_dump_trades', symbol);
             try {
                 const res = await apiRequest('/v5/order/create', {
                     category: 'linear', symbol, side: 'Sell', orderType: 'Market',
@@ -800,14 +834,38 @@ async function updateTrailingStop(symbol, currentPrice) {
 
     } else if (trade.trail_direction === 'short') {
         // ── Short trail ─────────────────────────────────────────────
-        if (currentPrice < (trade.trail_peak || Infinity)) {
-            // New low — advance the trailing SL downward
-            const profitPct = trade.short_entry > 0 ? (trade.short_entry - currentPrice) / trade.short_entry : 0;
-            const baseDist  = trade.trail_distance || TRAIL_INITIAL_PCT;
-            // Tighten to ~60% of base distance once profit exceeds 1.5x base distance
-            const trailDist = profitPct >= (baseDist * 1.5) ? Math.max(baseDist * 0.6, TRAIL_TIGHT_PCT) : baseDist;
-            const newSL     = parseFloat((Math.ceil(currentPrice * (1 + trailDist) / tickSize) * tickSize).toFixed(dec));
+        const profitPct = trade.short_entry > 0 ? (trade.short_entry - currentPrice) / trade.short_entry : 0;
+        const baseDist  = trade.trail_distance || 0.012; // default 1.2% wide leash
+        
+        let targetSL = 0;
+        let trailDist = baseDist;
 
+        // Stage 3: Mega-Run (> 3.0% profit) — Tighten leash to 0.6% behind peak
+        if (profitPct >= 0.030) {
+            trailDist = Math.max(baseDist * 0.5, 0.006);
+            targetSL = currentPrice * (1 + trailDist);
+        }
+        // Stage 2: Net Profit Lock (> 1.5% profit) — Guarantee minimum +1.0% exit to beat the cut loss
+        else if (profitPct >= 0.015) {
+            const minGuaranteed = trade.short_entry * 0.990; // Entry - 1.0%
+            const trailingCalc  = currentPrice * (1 + baseDist);
+            targetSL = Math.min(minGuaranteed, trailingCalc);
+        }
+        // Stage 1: Break-Even Arming (> 0.8% profit) — Lock SL at Break-Even - fee buffer
+        else if (profitPct >= 0.008) {
+            const breakevenSL   = trade.short_entry * 0.999; // Entry - 0.1% buffer
+            const trailingCalc  = currentPrice * (1 + baseDist);
+            targetSL = Math.min(breakevenSL, trailingCalc);
+        }
+        // Normal wide trailing
+        else {
+            targetSL = currentPrice * (1 + baseDist);
+        }
+
+        const newSL = parseFloat((Math.ceil(targetSL / tickSize) * tickSize).toFixed(dec));
+
+        if (currentPrice < (trade.trail_peak || Infinity)) {
+            // New low — record peak and advance SL downward
             if (!trade.trail_sl || newSL < trade.trail_sl) {
                 if (!lastTrailUpdate[symbol] || now - lastTrailUpdate[symbol] >= 500) {
                     lastTrailUpdate[symbol] = now;
@@ -815,15 +873,25 @@ async function updateTrailingStop(symbol, currentPrice) {
                         .run(currentPrice, newSL, trailDist, symbol);
                     emitPdTradeUpdate(symbol);
                     syncFromSQLite(db, 'pump_dump_trades', symbol);
-                    console.log(`\x1b[31m[Trail] Short: peak=${currentPrice.toFixed(4)}, SL=${newSL} (dist=${(trailDist*100).toFixed(2)}%, profit=${(profitPct*100).toFixed(2)}%)\x1b[0m`);
+                    console.log(`\x1b[31m[Trail] Short: Peak=${currentPrice.toFixed(4)}, SL=${newSL} (Profit=${(profitPct*100).toFixed(2)}%, Trail=${(trailDist*100).toFixed(2)}%)\x1b[0m`);
                 }
+            }
+        } else if (!trade.trail_sl || newSL < trade.trail_sl) {
+            // Ratchet SL downward even between peaks if stage upgrade occurs
+            if (!lastTrailUpdate[symbol] || now - lastTrailUpdate[symbol] >= 500) {
+                lastTrailUpdate[symbol] = now;
+                db.prepare('UPDATE pump_dump_trades SET trail_sl=?, trail_distance=? WHERE symbol=?')
+                    .run(newSL, trailDist, symbol);
+                emitPdTradeUpdate(symbol);
+                syncFromSQLite(db, 'pump_dump_trades', symbol);
+                console.log(`\x1b[31m[Trail] Short SL Ratcheted: SL=${newSL} (Profit=${(profitPct*100).toFixed(2)}%)\x1b[0m`);
             }
         } else if (trade.trail_sl && currentPrice >= trade.trail_sl) {
             // ✅ Trail SL hit — close tradeQty of short reduce-only
             trailClosingFlags[symbol] = true;
             console.log(`[PD] Short trail SL hit @ ${currentPrice.toFixed(4)} (SL was ${trade.trail_sl}). Closing ${tradeQty} short...`);
             db.prepare('UPDATE pump_dump_trades SET status=? WHERE symbol=?').run('closing', symbol);
-            syncFromSQLite(db, 'pump_dump_trades', symbol);  // persist 'closing' state immediately
+            syncFromSQLite(db, 'pump_dump_trades', symbol);
             try {
                 const res = await apiRequest('/v5/order/create', {
                     category: 'linear', symbol, side: 'Buy', orderType: 'Market',
