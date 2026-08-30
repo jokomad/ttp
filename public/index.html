@@ -1,0 +1,1077 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pump/Dump Detector — Bybit</title>
+    <meta name="description" content="Real-time pump/dump detection with automatic hedge positions and trailing stop on Bybit perpetual futures.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        :root {
+            --bg:       #080b10;
+            --card:     #0e1218;
+            --card2:    #131820;
+            --border:   #1a2030;
+            --green:    #00e676;
+            --red:      #ff1744;
+            --yellow:   #ffd600;
+            --blue:     #40c4ff;
+            --purple:   #ce93d8;
+            --orange:   #ff9100;
+            --text:     #cdd9e5;
+            --muted:    #546e7a;
+            --glow-g:   rgba(0,230,118,0.15);
+            --glow-r:   rgba(255,23,68,0.15);
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+        }
+
+        /* ── Scrollbar ──────────────────────────────────── */
+        ::-webkit-scrollbar       { width: 4px; height: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #1e2d3d; border-radius: 2px; }
+
+        /* ── Top Bar ────────────────────────────────────── */
+        .topbar {
+            width: 100%;
+            max-width: 500px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 0;
+        }
+        .logo {
+            font-size: 1em;
+            font-weight: 700;
+            background: linear-gradient(90deg, var(--green) 0%, var(--blue) 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.3px;
+        }
+        #status-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: var(--muted);
+            transition: background 0.3s, box-shadow 0.3s;
+        }
+        #status-dot.ok  { background: var(--green); box-shadow: 0 0 6px var(--green); }
+        #status-dot.err { background: var(--red);   box-shadow: 0 0 6px var(--red); }
+
+        /* ── WS Status ──────────────────────────────────── */
+        #ws-bar {
+            width: 100%;
+            max-width: 500px;
+            font-size: 0.72em;
+            font-family: 'JetBrains Mono', monospace;
+            padding: 5px 12px;
+            border-radius: 6px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            color: var(--muted);
+            text-align: center;
+            transition: color 0.3s;
+        }
+        #ws-bar.ok   { color: var(--green); }
+        #ws-bar.err  { color: var(--red);   }
+        #ws-bar.warn { color: var(--yellow);}
+
+        /* ── Search ─────────────────────────────────────── */
+        .search-wrap {
+            position: relative;
+            width: 100%;
+            max-width: 500px;
+        }
+        #search-box {
+            width: 100%;
+            padding: 13px 18px;
+            font-size: 0.95em;
+            font-family: 'Inter', sans-serif;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            color: var(--text);
+            outline: none;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        #search-box::placeholder { color: var(--muted); }
+        #search-box:focus {
+            border-color: var(--green);
+            box-shadow: 0 0 0 3px rgba(0,230,118,0.08);
+        }
+        #dropdown {
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0; right: 0;
+            background: var(--card2);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            max-height: 240px;
+            overflow-y: auto;
+            z-index: 200;
+            display: none;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+        }
+        .dd-item {
+            padding: 10px 18px;
+            font-size: 0.88em;
+            font-family: 'JetBrains Mono', monospace;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .dd-item:hover { background: rgba(255,255,255,0.04); }
+
+        /* ── Cards ──────────────────────────────────────── */
+        .card {
+            width: 100%;
+            max-width: 500px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 16px 18px;
+            display: none;
+        }
+        .card-label {
+            font-size: 0.68em;
+            font-weight: 600;
+            letter-spacing: 1.2px;
+            text-transform: uppercase;
+            color: var(--muted);
+            margin-bottom: 14px;
+        }
+
+        /* ── Price Card ─────────────────────────────────── */
+        #price-card { display: none; }
+        .price-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .sym-label {
+            font-size: 1.25em;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            letter-spacing: -0.5px;
+        }
+        .live-price {
+            font-size: 1.6em;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            transition: color 0.3s;
+            color: var(--text);
+        }
+        .price-up   { color: var(--green) !important; }
+        .price-down { color: var(--red)   !important; }
+
+        .sym-meta {
+            display: flex;
+            gap: 20px;
+            margin-top: 10px;
+            font-size: 0.78em;
+            color: var(--muted);
+        }
+        .sym-meta span b { color: var(--text); }
+
+        /* ── Buttons ────────────────────────────────────── */
+        .btn-row {
+            display: flex;
+            gap: 8px;
+            margin-top: 16px;
+        }
+        .btn {
+            flex: 1;
+            padding: 11px 6px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.82em;
+            font-weight: 700;
+            font-family: 'Inter', sans-serif;
+            letter-spacing: 0.5px;
+            cursor: pointer;
+            transition: opacity 0.15s, transform 0.1s, box-shadow 0.2s;
+        }
+        .btn:hover  { opacity: 0.88; }
+        .btn:active { transform: scale(0.97); }
+        .btn-start {
+            background: var(--green);
+            color: #000;
+            box-shadow: 0 0 0 rgba(0,230,118,0);
+        }
+        .btn-start:hover { box-shadow: 0 0 12px rgba(0,230,118,0.35); }
+        .btn-stop  { background: rgba(255,23,68,0.1);   color: var(--red);    border: 1px solid rgba(255,23,68,0.3); }
+        .btn-close { background: rgba(255,145,0,0.1);   color: var(--orange); border: 1px solid rgba(255,145,0,0.3); }
+
+        /* ── Signal Gauge Card ──────────────────────────── */
+        .gauge-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+        }
+
+        .gauge-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 8px;
+        }
+        .gauge-name {
+            font-size: 0.8em;
+            font-weight: 600;
+            color: var(--muted);
+        }
+        .gauge-score {
+            font-size: 1.5em;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            transition: color 0.4s, text-shadow 0.4s;
+        }
+        .gauge-pump .gauge-score { color: var(--green); }
+        .gauge-dump .gauge-score { color: var(--red); }
+        .gauge-pump.at-threshold .gauge-score {
+            text-shadow: 0 0 12px var(--green);
+            animation: score-pulse 0.6s ease-in-out infinite alternate;
+        }
+        .gauge-dump.at-threshold .gauge-score {
+            text-shadow: 0 0 12px var(--red);
+            animation: score-pulse 0.6s ease-in-out infinite alternate;
+        }
+        @keyframes score-pulse { from { opacity: 0.7; } to { opacity: 1; } }
+
+        .signal-bars {
+            display: flex;
+            gap: 3px;
+        }
+        .sig-bar {
+            flex: 1;
+            height: 20px;
+            border-radius: 3px;
+            background: rgba(255,255,255,0.05);
+            transition: background 0.35s, box-shadow 0.35s;
+        }
+        .gauge-pump .sig-bar.on {
+            background: var(--green);
+            box-shadow: 0 0 6px rgba(0,230,118,0.4);
+        }
+        .gauge-dump .sig-bar.on {
+            background: var(--red);
+            box-shadow: 0 0 6px rgba(255,23,68,0.4);
+        }
+        .gauge-pump.at-threshold .sig-bar.on {
+            animation: bar-glow-g 0.7s ease-in-out infinite alternate;
+        }
+        .gauge-dump.at-threshold .sig-bar.on {
+            animation: bar-glow-r 0.7s ease-in-out infinite alternate;
+        }
+        @keyframes bar-glow-g {
+            from { box-shadow: 0 0 5px rgba(0,230,118,0.4); }
+            to   { box-shadow: 0 0 14px rgba(0,230,118,0.9); }
+        }
+        @keyframes bar-glow-r {
+            from { box-shadow: 0 0 5px rgba(255,23,68,0.4); }
+            to   { box-shadow: 0 0 14px rgba(255,23,68,0.9); }
+        }
+
+        .signal-tags {
+            margin-top: 10px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+        }
+        .sig-tag {
+            font-size: 0.68em;
+            padding: 2px 8px;
+            border-radius: 20px;
+            font-family: 'JetBrains Mono', monospace;
+            white-space: nowrap;
+        }
+        .sig-tag-pump { background: rgba(0,230,118,0.1); color: var(--green); }
+        .sig-tag-dump { background: rgba(255,23,68,0.1);  color: var(--red); }
+
+        /* ── Trade Status Card ──────────────────────────── */
+        .trade-phase-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 14px;
+            border-radius: 20px;
+            font-size: 0.72em;
+            font-weight: 700;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            margin-bottom: 14px;
+        }
+        .phase-idle           { background: rgba(84,110,122,0.15); color: var(--muted); }
+        .phase-hedged         { background: rgba(64,196,255,0.12); color: var(--blue); }
+        .phase-trailing-long  { background: rgba(0,230,118,0.12);  color: var(--green); }
+        .phase-trailing-short { background: rgba(255,23,68,0.12);   color: var(--red); }
+        .phase-closed         { background: rgba(84,110,122,0.1);  color: var(--muted); }
+
+        .trade-grid-4 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+        .tcell {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 9px 12px;
+        }
+        .tcell-label {
+            font-size: 0.66em;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            margin-bottom: 4px;
+        }
+        .tcell-value {
+            font-size: 0.9em;
+            font-weight: 600;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .tcell-green  { color: var(--green); }
+        .tcell-red    { color: var(--red); }
+        .tcell-purple { color: var(--purple); }
+        .tcell-blue   { color: var(--blue); }
+
+        .trail-panel {
+            margin-top: 10px;
+            background: rgba(206,147,216,0.06);
+            border: 1px solid rgba(206,147,216,0.18);
+            border-radius: 8px;
+            padding: 10px 14px;
+        }
+        .trail-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.8em;
+            margin-bottom: 3px;
+        }
+        .trail-row:last-child { margin-bottom: 0; }
+        .trail-row span:first-child { color: var(--purple); }
+        .trail-row span:last-child  { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
+
+        /* ── Positions Card ─────────────────────────────── */
+        .combined-banner {
+            text-align: center;
+            padding: 8px;
+            border-radius: 8px;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.95em;
+            margin-bottom: 10px;
+        }
+        .comb-pos { background: var(--glow-g); color: var(--green); }
+        .comb-neg { background: var(--glow-r); color: var(--red); }
+        .comb-zero { background: rgba(255,255,255,0.04); color: var(--muted); }
+
+        .pos-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(255,255,255,0.03);
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 6px;
+        }
+        .pos-row:last-child { margin-bottom: 0; }
+        .pos-row.is-buy  { border-left: 3px solid var(--green); }
+        .pos-row.is-sell { border-left: 3px solid var(--red); }
+        .pos-side-lbl { font-weight: 700; font-size: 0.85em; }
+        .pos-side-buy  { color: var(--green); }
+        .pos-side-sell { color: var(--red); }
+        .pos-info { font-size: 0.75em; color: var(--muted); margin-top: 2px; }
+        .pos-pnl { font-weight: 700; font-family: 'JetBrains Mono', monospace; font-size: 0.88em; }
+        .pnl-pos { color: var(--green); }
+        .pnl-neg { color: var(--red); }
+        .pos-entry { font-size: 0.72em; color: var(--muted); margin-top: 2px; text-align: right; }
+
+        /* ── Event Log ──────────────────────────────────── */
+        .event-scroll {
+            max-height: 190px;
+            overflow-y: auto;
+        }
+        .ev-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            padding: 6px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
+            font-size: 0.75em;
+        }
+        .ev-item:last-child { border-bottom: none; }
+        .ev-time {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--muted);
+            white-space: nowrap;
+            min-width: 46px;
+        }
+        .ev-badge {
+            font-size: 0.72em;
+            padding: 1px 7px;
+            border-radius: 4px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .badge-START { background: rgba(64,196,255,0.15);   color: var(--blue); }
+        .badge-PUMP  { background: rgba(0,230,118,0.15);    color: var(--green); }
+        .badge-DUMP  { background: rgba(255,23,68,0.15);    color: var(--red); }
+        .badge-TRAIL { background: rgba(206,147,216,0.15);  color: var(--purple); }
+        .badge-LIQ   { background: rgba(255,214,0,0.15);   color: var(--yellow); }
+        .badge-CLOSE { background: rgba(84,110,122,0.15);   color: var(--muted); }
+        .ev-msg { color: var(--muted); line-height: 1.45; flex: 1; }
+
+        /* ── Hedge Monitor Card (manual leg) ────────────── */
+        .hrow {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.82em;
+            margin-bottom: 6px;
+        }
+        .hrow span:first-child { color: var(--muted); }
+        .hrow b { font-family: 'JetBrains Mono', monospace; }
+
+        /* ── Session & Performance Card ─────────────────── */
+        .session-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+        .stat-box {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 12px;
+            text-align: center;
+        }
+        .stat-label {
+            font-size: 0.68em;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            margin-bottom: 4px;
+            font-weight: 600;
+        }
+        .stat-value {
+            font-size: 1.25em;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .stat-sub {
+            font-size: 0.7em;
+            color: var(--muted);
+            margin-top: 3px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .last-trade-details {
+            background: rgba(255,255,255,0.02);
+            border: 1px dashed var(--border);
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 0.76em;
+        }
+        .last-trade-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+        }
+        .last-trade-row:last-child { margin-bottom: 0; }
+        .last-trade-row span:first-child { color: var(--muted); }
+        .last-trade-row span:last-child { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
+
+        /* ── Divider ────────────────────────────────────── */
+        .divider {
+            width: 100%;
+            max-width: 500px;
+            height: 1px;
+            background: var(--border);
+            opacity: 0.5;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="topbar">
+        <span class="logo">⚡ Pump/Dump Detector</span>
+        <div style="display:flex; align-items:center; gap:8px;">
+            <span id="status-text" style="font-size:0.72em; color:var(--muted)">Connecting</span>
+            <div id="status-dot"></div>
+        </div>
+    </div>
+
+    <div id="ws-bar">Initializing...</div>
+
+    <div class="search-wrap">
+        <input type="text" id="search-box" placeholder="Search symbol  (e.g. SOLUSDT)" autocomplete="off">
+        <div id="dropdown"></div>
+    </div>
+
+    <!-- ── Price + Controls Card ──────────────────────── -->
+    <div class="card" id="price-card">
+        <div class="price-row">
+            <span class="sym-label" id="sym-name">—</span>
+            <span class="live-price" id="live-price">—</span>
+        </div>
+        <div class="sym-meta" id="sym-meta"></div>
+        <div class="btn-row">
+            <button class="btn btn-start" id="btn-start" onclick="startTrading()">▶ START</button>
+            <button class="btn btn-stop"  id="btn-stop"  onclick="stopTrading()">■ STOP</button>
+            <button class="btn btn-close" id="btn-close" onclick="closePositions()">✕ CLOSE ALL</button>
+        </div>
+    </div>
+
+    <!-- ── Session PnL Card ───────────────────────────── -->
+    <div class="card" id="session-card">
+        <div class="card-label">Session Profit & Loss <span id="session-sym" style="color:var(--blue); float:right; text-transform:none; font-family:'JetBrains Mono',monospace;"></span></div>
+        <div class="session-grid">
+            <div class="stat-box">
+                <div class="stat-label">Last Hedge PnL</div>
+                <div class="stat-value" id="last-trade-pnl" style="color:var(--muted)">0.0000 USDT</div>
+                <div class="stat-sub" id="last-trade-status">No completed trades</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Session Net PnL</div>
+                <div class="stat-value" id="session-pnl" style="color:var(--muted)">0.0000 USDT</div>
+                <div class="stat-sub" id="session-count">0 trades</div>
+            </div>
+        </div>
+        <div class="last-trade-details" id="last-trade-details" style="display:none;">
+            <div class="last-trade-row"><span>Type / Outcome</span><span id="lt-type">—</span></div>
+            <div class="last-trade-row"><span>Cut Leg PnL</span><span id="lt-cut">—</span></div>
+            <div class="last-trade-row"><span>Trailing Leg PnL</span><span id="lt-trail">—</span></div>
+            <div class="last-trade-row"><span>Closed Exit Price</span><span id="lt-exit">—</span></div>
+        </div>
+    </div>
+
+    <!-- ── Signal Gauge Card ──────────────────────────── -->
+    <div class="card" id="signal-card">
+        <div class="card-label">Signal Detector  <span style="color:var(--blue); float:right; font-size:0.85em;">threshold: 4 / 7</span></div>
+        <div class="gauge-grid">
+            <div class="gauge-box gauge-pump" id="gauge-pump">
+                <div class="gauge-head">
+                    <span class="gauge-name">🚀 PUMP</span>
+                    <span class="gauge-score" id="pump-score">0</span>
+                </div>
+                <div class="signal-bars" id="pump-bars"></div>
+            </div>
+            <div class="gauge-box gauge-dump" id="gauge-dump">
+                <div class="gauge-head">
+                    <span class="gauge-name">📉 DUMP</span>
+                    <span class="gauge-score" id="dump-score">0</span>
+                </div>
+                <div class="signal-bars" id="dump-bars"></div>
+            </div>
+        </div>
+        <div class="signal-tags" id="signal-tags"></div>
+    </div>
+
+    <!-- ── Active Trade Card ──────────────────────────── -->
+    <div class="card" id="trade-card">
+        <div class="card-label">Active Trade</div>
+        <span class="trade-phase-badge phase-idle" id="trade-phase">NO TRADE</span>
+        <div class="trade-grid-4" id="trade-cells"></div>
+        <div class="trail-panel" id="trail-panel" style="display:none"></div>
+    </div>
+
+    <!-- ── Positions Card ─────────────────────────────── -->
+    <div class="card" id="pos-card">
+        <div class="card-label">Live Positions</div>
+        <div id="pos-list"></div>
+    </div>
+
+    <!-- ── Signal Event Log ───────────────────────────── -->
+    <div class="card" id="event-card">
+        <div class="card-label">Signal Events</div>
+        <div class="event-scroll" id="event-log"></div>
+    </div>
+
+    <!-- ── Manual Leg Monitor ─────────────────────────── -->
+    <div class="card" id="hedge-card">
+        <div class="card-label">Manual Leg Monitor (1% hedge)</div>
+        <div class="hrow"><span>Status</span>          <b id="leg-status" style="color:var(--muted)">INACTIVE</b></div>
+        <div class="hrow"><span>Direction</span>       <b id="leg-dir">NONE</b></div>
+        <div class="hrow"><span>Size / Open</span>     <b id="leg-info" style="color:var(--text)">—</b></div>
+        <div class="hrow"><span>1% Triggers</span>     <b id="leg-triggers" style="color:var(--blue)">—</b></div>
+        <div class="hrow" style="margin-bottom:0"><span>Hedge Status</span> <b id="leg-hedged" style="color:var(--muted)">N/A</b></div>
+    </div>
+
+    <script>
+    'use strict';
+
+    const socket = io();
+    let currentSymbol = null;
+    let symbolList    = [];
+    let lastPrice     = null;
+
+    // ── Init gauge bars ─────────────────────────────────
+    function initBars(containerId, count) {
+        const el = document.getElementById(containerId);
+        el.innerHTML = '';
+        for (let i = 0; i < count; i++) {
+            const b = document.createElement('div');
+            b.className = 'sig-bar';
+            b.id = `${containerId}-${i}`;
+            el.appendChild(b);
+        }
+    }
+    initBars('pump-bars', 7);
+    initBars('dump-bars', 7);
+
+    // ── Socket events ───────────────────────────────────
+    socket.on('connect', () => {
+        document.getElementById('status-dot').className = 'ok';
+        document.getElementById('status-text').textContent = 'Connected';
+        if (currentSymbol) socket.emit('watchSymbol', currentSymbol);
+    });
+
+    socket.on('disconnect', () => {
+        document.getElementById('status-dot').className = 'err';
+        document.getElementById('status-text').textContent = 'Disconnected';
+    });
+
+    socket.on('symbolList', list => { symbolList = list; });
+
+    socket.on('wsStatus', ({ connected, symbol, reason }) => {
+        const bar = document.getElementById('ws-bar');
+        if (connected) {
+            bar.className = 'ok';
+            bar.textContent = `WS: Live ✓  ${symbol}`;
+            document.getElementById('signal-card').style.display = 'block';
+            document.getElementById('event-card').style.display  = 'block';
+        } else {
+            bar.className = 'err';
+            bar.textContent = `WS: ${reason || 'Disconnected'} — reconnecting...`;
+        }
+    });
+
+    socket.on('wsWarning', ({ message }) => {
+        const bar = document.getElementById('ws-bar');
+        bar.className = 'warn';
+        bar.textContent = message;
+    });
+
+    socket.on('livePrice', (data) => {
+        currentSymbol = data.symbol;
+        const bar = document.getElementById('ws-bar');
+        bar.className = 'ok';
+        bar.textContent = `WS: Live ✓  ${data.symbol}`;
+        renderPriceCard(data);
+    });
+
+    socket.on('signalUpdate', ({ symbol, pump, dump, details, maxSignals }) => {
+        if (symbol !== currentSymbol) return;
+        updateGauge('pump', pump, maxSignals, pump >= 4);
+        updateGauge('dump', dump, maxSignals, dump >= 4);
+        const tagsEl = document.getElementById('signal-tags');
+        tagsEl.innerHTML = details.map(d =>
+            `<span class="sig-tag sig-tag-${d.d}">${d.s}: ${d.v}</span>`
+        ).join('');
+    });
+
+    socket.on('pdTradeUpdate', ({ symbol, trade }) => {
+        if (symbol !== currentSymbol) return;
+        renderTradeCard(trade);
+    });
+
+    socket.on('positions', ({ symbol, list }) => {
+        if (symbol !== currentSymbol) return;
+        renderPositions(list);
+    });
+
+    socket.on('signalEvent', ({ symbol, type, message, ts }) => {
+        if (symbol !== currentSymbol) return;
+        appendEvent(type, message, ts);
+    });
+
+    socket.on('legUpdate', ({ symbol, active, leg }) => {
+        if (symbol !== currentSymbol) return;
+        renderHedgeCard(active, leg);
+    });
+
+    // ── Gauge updater ───────────────────────────────────
+    function updateGauge(type, score, max, atThreshold) {
+        document.getElementById(`${type}-score`).textContent = score;
+        const gBox = document.getElementById(`gauge-${type}`);
+        gBox.classList.toggle('at-threshold', atThreshold);
+        for (let i = 0; i < max; i++) {
+            const bar = document.getElementById(`${type}-bars-${i}`);
+            if (bar) bar.classList.toggle('on', i < score);
+        }
+    }
+
+    // ── Price card ──────────────────────────────────────
+    function renderPriceCard(data) {
+        const price = parseFloat(data.price);
+        const card  = document.getElementById('price-card');
+        card.style.display = 'block';
+
+        document.getElementById('sym-name').textContent  = data.symbol;
+        document.getElementById('live-price').textContent = data.price;
+
+        if (lastPrice !== null && price !== lastPrice) {
+            const cls = price > lastPrice ? 'price-up' : 'price-down';
+            const el  = document.getElementById('live-price');
+            el.className = `live-price ${cls}`;
+            const captured = data.price;
+            setTimeout(() => {
+                const e = document.getElementById('live-price');
+                if (e && e.textContent === captured) e.className = 'live-price';
+            }, 600);
+        }
+        lastPrice = price;
+
+        if (data.info) {
+            document.getElementById('sym-meta').innerHTML =
+                `<span>Min qty: <b>${data.info.minOrderQty} ${data.info.baseCoin}</b></span>` +
+                `<span>Max lev: <b>${data.info.maxLeverage}×</b></span>` +
+                `<span>Tick: <b>${data.info.tickSize}</b></span>`;
+        }
+    }
+
+    // ── Session State ────────────────────────────────────
+    let sessionTrades = [];
+    let sessionNetPnl = 0;
+    let seenTradeIds  = new Set();
+
+    function resetSessionStats(symbol) {
+        sessionTrades = [];
+        sessionNetPnl = 0;
+        seenTradeIds.clear();
+        updateSessionUI(symbol);
+    }
+
+    function updateSessionUI(symbol) {
+        document.getElementById('session-card').style.display = 'block';
+        document.getElementById('session-sym').textContent = symbol ? `@ ${symbol}` : '';
+        
+        const lastEl = document.getElementById('last-trade-pnl');
+        const sessEl = document.getElementById('session-pnl');
+        const countEl = document.getElementById('session-count');
+        const statusEl = document.getElementById('last-trade-status');
+        const detailsEl = document.getElementById('last-trade-details');
+
+        if (sessionTrades.length === 0) {
+            lastEl.textContent = '0.0000 USDT';
+            lastEl.style.color = 'var(--muted)';
+            statusEl.textContent = 'No completed trades';
+            sessEl.textContent = '0.0000 USDT';
+            sessEl.style.color = 'var(--muted)';
+            countEl.textContent = '0 trades in session';
+            detailsEl.style.display = 'none';
+            return;
+        }
+
+        const last = sessionTrades[sessionTrades.length - 1];
+        const lastPnl = last.total_pnl || 0;
+        lastEl.textContent = `${lastPnl >= 0 ? '+' : ''}${lastPnl.toFixed(4)} USDT`;
+        lastEl.style.color = lastPnl >= 0 ? 'var(--green)' : 'var(--red)';
+        statusEl.textContent = `${last.trail_direction === 'long' ? '🚀 PUMP' : '📉 DUMP'} trade (${last.qty} qty)`;
+
+        sessEl.textContent = `${sessionNetPnl >= 0 ? '+' : ''}${sessionNetPnl.toFixed(4)} USDT`;
+        sessEl.style.color = sessionNetPnl >= 0 ? 'var(--green)' : 'var(--red)';
+        
+        const wins = sessionTrades.filter(t => (t.total_pnl || 0) > 0).length;
+        const wr = ((wins / sessionTrades.length) * 100).toFixed(0);
+        countEl.textContent = `${sessionTrades.length} trade${sessionTrades.length > 1 ? 's' : ''} (${wins}W / ${sessionTrades.length - wins}L · ${wr}% win)`;
+
+        // Show details breakdown
+        detailsEl.style.display = 'block';
+        document.getElementById('lt-type').textContent = `${(last.trail_direction || '—').toUpperCase()} TRAIL`;
+        
+        const cut = last.cut_pnl || 0;
+        const trail = last.trail_pnl || 0;
+        const ltCut = document.getElementById('lt-cut');
+        ltCut.textContent = `${cut >= 0 ? '+' : ''}${cut.toFixed(4)} USDT`;
+        ltCut.style.color = cut >= 0 ? 'var(--green)' : 'var(--red)';
+
+        const ltTrail = document.getElementById('lt-trail');
+        ltTrail.textContent = `${trail >= 0 ? '+' : ''}${trail.toFixed(4)} USDT`;
+        ltTrail.style.color = trail >= 0 ? 'var(--green)' : 'var(--red)';
+
+        document.getElementById('lt-exit').textContent = last.close_price ? last.close_price.toFixed(4) : (last.trail_sl ? last.trail_sl.toFixed(4) : '—');
+    }
+
+    socket.on('pdTradeUpdate', ({ symbol, trade }) => {
+        if (symbol !== currentSymbol) return;
+        renderTradeCard(trade);
+
+        if (trade && trade.status === 'closed') {
+            const tradeId = `${trade.symbol}-${trade.created_at}`;
+            const existingIdx = sessionTrades.findIndex(t => `${t.symbol}-${t.created_at}` === tradeId);
+            
+            if (existingIdx >= 0) {
+                // Update existing trade record with finalized PnL
+                const oldPnl = parseFloat(sessionTrades[existingIdx].total_pnl || 0);
+                const newPnl = parseFloat(trade.total_pnl || 0);
+                sessionTrades[existingIdx] = trade;
+                sessionNetPnl = sessionNetPnl - oldPnl + newPnl;
+            } else {
+                // Add new closed trade
+                sessionTrades.push(trade);
+                sessionNetPnl += parseFloat(trade.total_pnl || 0);
+            }
+            updateSessionUI(symbol);
+        }
+    });
+
+    // ── Trade card ──────────────────────────────────────
+    function renderTradeCard(trade) {
+        const card = document.getElementById('trade-card');
+        card.style.display = 'block';
+
+        const phaseEl = document.getElementById('trade-phase');
+        const map = {
+            'hedged':         ['⚖ HEDGED — SCANNING',         'phase-hedged'],
+            'trailing_long':  ['📈 TRAILING LONG',             'phase-trailing-long'],
+            'trailing_short': ['📉 TRAILING SHORT',            'phase-trailing-short'],
+            'closed':         ['✓ CLOSED',                     'phase-closed'],
+        };
+        if (!trade) {
+            phaseEl.textContent = 'NO TRADE';
+            phaseEl.className   = 'trade-phase-badge phase-idle';
+            document.getElementById('trade-cells').innerHTML = '';
+            document.getElementById('trail-panel').style.display = 'none';
+            return;
+        }
+        const [label, cls] = map[trade.status] || ['—', 'phase-idle'];
+        phaseEl.textContent = label;
+        phaseEl.className   = `trade-phase-badge ${cls}`;
+
+        document.getElementById('trade-cells').innerHTML = `
+            <div class="tcell">
+                <div class="tcell-label">Long Entry</div>
+                <div class="tcell-value tcell-green">${trade.long_entry ? trade.long_entry.toFixed(4) : '—'}</div>
+            </div>
+            <div class="tcell">
+                <div class="tcell-label">Short Entry</div>
+                <div class="tcell-value tcell-red">${trade.short_entry ? trade.short_entry.toFixed(4) : '—'}</div>
+            </div>
+            <div class="tcell">
+                <div class="tcell-label">Position Qty</div>
+                <div class="tcell-value tcell-blue">${trade.qty || '—'}</div>
+            </div>
+            <div class="tcell">
+                <div class="tcell-label">Trade Qty (min)</div>
+                <div class="tcell-value tcell-blue">${trade.trade_qty || '—'}</div>
+            </div>
+            <div class="tcell">
+                <div class="tcell-label">Leverage</div>
+                <div class="tcell-value tcell-blue">5× / 5 USDT</div>
+            </div>
+        `;
+
+        const trailEl = document.getElementById('trail-panel');
+        if (trade.status === 'trailing_long' || trade.status === 'trailing_short') {
+            trailEl.style.display = 'block';
+            const dir   = trade.trail_direction;
+            const color = dir === 'long' ? 'var(--green)' : 'var(--red)';
+            trailEl.innerHTML = `
+                <div class="trail-row">
+                    <span>Direction</span>
+                    <span style="color:${color}">${dir === 'long' ? '📈 Long' : '📉 Short'}</span>
+                </div>
+                <div class="trail-row">
+                    <span>Peak Price</span>
+                    <span>${trade.trail_peak ? trade.trail_peak.toFixed(4) : '—'}</span>
+                </div>
+                <div class="trail-row">
+                    <span>Trail SL</span>
+                    <span style="color:${color}">${trade.trail_sl ? trade.trail_sl.toFixed(4) : '—'}</span>
+                </div>
+                <div class="trail-row">
+                    <span>Distance</span>
+                    <span>${trade.trail_distance ? (trade.trail_distance * 100).toFixed(1) + '%' : '—'}</span>
+                </div>
+            `;
+        } else {
+            trailEl.style.display = 'none';
+        }
+    }
+
+    // ── Positions card ──────────────────────────────────
+    function renderPositions(list) {
+        const card = document.getElementById('pos-card');
+        const el   = document.getElementById('pos-list');
+        if (!list || list.length === 0) {
+            card.style.display = 'none';
+            return;
+        }
+        card.style.display = 'block';
+
+        let combined = 0;
+        list.forEach(p => combined += parseFloat(p.unrealisedPnl || 0));
+        let combClass = 'comb-zero', combSign = '';
+        if (combined > 0)   { combClass = 'comb-pos'; combSign = '+'; }
+        if (combined < 0)   { combClass = 'comb-neg'; }
+
+        el.innerHTML = `
+            <div class="combined-banner ${combClass}">
+                Combined PnL: ${combSign}${combined.toFixed(4)} USDT
+            </div>
+            ${list.map(pos => {
+                const pnl   = parseFloat(pos.unrealisedPnl || 0);
+                const isBuy = pos.side === 'Buy';
+                const pCls  = pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+                const pSign = pnl >= 0 ? '+' : '';
+                return `
+                <div class="pos-row ${isBuy ? 'is-buy' : 'is-sell'}">
+                    <div>
+                        <div class="pos-side-lbl ${isBuy ? 'pos-side-buy' : 'pos-side-sell'}">${pos.side.toUpperCase()}</div>
+                        <div class="pos-info">Size: ${pos.size}</div>
+                    </div>
+                    <div style="text-align:right">
+                        <div class="pos-entry">Entry: ${parseFloat(pos.avgPrice).toFixed(4)}</div>
+                        <div class="pos-pnl ${pCls}">${pSign}${pnl.toFixed(4)} USDT</div>
+                    </div>
+                </div>`;
+            }).join('')}
+        `;
+    }
+
+    // ── Event log ───────────────────────────────────────
+    const MAX_EV = 25;
+    function appendEvent(type, message, ts) {
+        document.getElementById('event-card').style.display = 'block';
+        const log  = document.getElementById('event-log');
+        const time = new Date(ts).toLocaleTimeString('en-US', { hour12: false });
+        const item = document.createElement('div');
+        item.className = 'ev-item';
+        item.innerHTML =
+            `<span class="ev-time">${time}</span>` +
+            `<span class="ev-badge badge-${type}">${type}</span>` +
+            `<span class="ev-msg">${message}</span>`;
+        log.insertBefore(item, log.firstChild);
+        while (log.children.length > MAX_EV) log.removeChild(log.lastChild);
+    }
+
+    // ── Hedge monitor (manual leg) ──────────────────────
+    function renderHedgeCard(active, leg) {
+        const card = document.getElementById('hedge-card');
+        if (!active && !leg) { card.style.display = 'none'; return; }
+        card.style.display = 'block';
+
+        const stEl = document.getElementById('leg-status');
+        if (active && leg) {
+            if (leg.hedged === 0) { stEl.textContent = 'WATCHING 1%'; stEl.style.color = 'var(--blue)'; }
+            else                  { stEl.textContent = 'HEDGED ✓';    stEl.style.color = 'var(--green)'; }
+        } else if (active) {
+            stEl.textContent = 'WAITING FOR MANUAL POSITION'; stEl.style.color = 'var(--yellow)';
+        } else {
+            stEl.textContent = 'INACTIVE'; stEl.style.color = 'var(--muted)';
+        }
+
+        if (leg) {
+            document.getElementById('leg-dir').textContent      = leg.leg_direction.toUpperCase();
+            document.getElementById('leg-info').textContent     = `${leg.size} @ ${leg.open_price.toFixed(5)}`;
+            document.getElementById('leg-triggers').textContent = `${(leg.open_price * 0.99).toFixed(5)} / ${(leg.open_price * 1.01).toFixed(5)}`;
+            const hedgedEl = document.getElementById('leg-hedged');
+            hedgedEl.textContent   = leg.hedged === 1 ? 'HEDGED ✓' : 'WAITING';
+            hedgedEl.style.color   = leg.hedged === 1 ? 'var(--green)' : 'var(--yellow)';
+        } else {
+            document.getElementById('leg-dir').textContent      = 'NONE';
+            document.getElementById('leg-info').textContent     = '—';
+            document.getElementById('leg-triggers').textContent = '—';
+            document.getElementById('leg-hedged').textContent   = 'N/A';
+            document.getElementById('leg-hedged').style.color   = 'var(--muted)';
+        }
+    }
+
+    // ── Actions ──────────────────────────────────────────
+    function startTrading() {
+        if (currentSymbol) socket.emit('startTrading', { symbol: currentSymbol });
+    }
+
+    function stopTrading() {
+        if (currentSymbol) {
+            socket.emit('stopTrading', { symbol: currentSymbol });
+            // Reset session statistics on stop
+            resetSessionStats(currentSymbol);
+        }
+    }
+
+    function closePositions() {
+        if (currentSymbol) {
+            socket.emit('closePositions', { symbol: currentSymbol });
+            // Reset session statistics on close all
+            resetSessionStats(currentSymbol);
+        }
+    }
+
+    // ── Search ───────────────────────────────────────────
+    const searchBox = document.getElementById('search-box');
+    const dropdown  = document.getElementById('dropdown');
+
+    searchBox.addEventListener('input', e => {
+        const q = e.target.value.trim().toUpperCase();
+        dropdown.innerHTML = '';
+        if (!q) { dropdown.style.display = 'none'; return; }
+        const matches = symbolList.filter(s => s.includes(q)).slice(0, 12);
+        if (matches.length) {
+            dropdown.style.display = 'block';
+            matches.forEach(sym => {
+                const d = document.createElement('div');
+                d.className  = 'dd-item';
+                d.textContent = sym;
+                d.onclick = () => selectSymbol(sym);
+                dropdown.appendChild(d);
+            });
+        } else {
+            dropdown.style.display = 'none';
+        }
+    });
+
+    document.addEventListener('click', e => {
+        if (e.target !== searchBox && !dropdown.contains(e.target)) dropdown.style.display = 'none';
+    });
+
+    function selectSymbol(sym) {
+        currentSymbol = sym;
+        lastPrice     = null;
+        searchBox.value = '';
+        dropdown.style.display = 'none';
+
+        // Reset session statistics when switching symbol
+        resetSessionStats(sym);
+
+        // Reset and immediately show price card with symbol name + buttons
+        ['pos-card','event-card','hedge-card'].forEach(id => {
+            document.getElementById(id).style.display = 'none';
+        });
+        document.getElementById('event-log').innerHTML = '';
+        document.getElementById('signal-tags').innerHTML = '';
+        updateGauge('pump', 0, 6, false);
+        updateGauge('dump', 0, 6, false);
+        renderTradeCard(null);
+
+        // Show price card immediately so buttons are always accessible
+        document.getElementById('sym-name').textContent   = sym;
+        document.getElementById('live-price').textContent = '...';
+        document.getElementById('live-price').className   = 'live-price';
+        document.getElementById('sym-meta').innerHTML     = '';
+        document.getElementById('price-card').style.display = 'block';
+        document.getElementById('session-card').style.display = 'block';
+        document.getElementById('signal-card').style.display = 'block';
+        document.getElementById('trade-card').style.display  = 'block';
+
+        const bar = document.getElementById('ws-bar');
+        bar.className = '';
+        bar.textContent = `Connecting to ${sym}...`;
+
+        socket.emit('watchSymbol', sym);
+    }
+    </script>
+</body>
+</html>
