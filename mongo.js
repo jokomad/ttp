@@ -25,7 +25,7 @@ async function connectMongo(uri) {
     try {
         const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5000 });
         await client.connect();
-        mongoDB = client.db('buysellgrid');
+        mongoDB = client.db();  // uses the database name from the connection string URI
 
         // Ensure symbol is always indexed for fast upserts
         await mongoDB.collection('active_trades').createIndex({ symbol: 1 }, { unique: true });
