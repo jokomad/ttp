@@ -1,0 +1,10 @@
+node_modules/
+*.db
+*.7z
+.env
+scratch/
+v1-*
+v2-*
+v3-*
+v4-*
+v5-*
