@@ -282,6 +282,16 @@ class SignalScorer {
         this.bbState     = { direction: null, startTime: 0, initDist: 0 };
     }
 
+    getVolatility() {
+        if (this.priceHistory.length < 5) return 0.005; // default 0.5%
+        const samples  = this.priceHistory.slice(-30).map(p => p.price);
+        const n        = samples.length;
+        const sma      = samples.reduce((a, v) => a + v, 0) / n;
+        const variance = samples.reduce((a, v) => a + (v - sma) ** 2, 0) / n;
+        const stdDev   = Math.sqrt(variance);
+        return sma > 0 ? (stdDev / sma) : 0.005;
+    }
+
     updatePrice(price) {
         const now = Date.now();
         this.priceHistory.push({ time: now, price });
@@ -593,47 +603,103 @@ async function handleSignalScore(symbol, pumpScore, dumpScore, currentPrice) {
     }
 }
 
+// ─── Statistical Dynamic Parameter Calculator ───────────
+function calculateDynamicParams(symbol, currentPrice, direction, trade) {
+    const info = cachedInstrumentInfo[symbol];
+    const scorer = signalScorers[symbol];
+    const liveVol = scorer ? scorer.getVolatility() : 0.005;
+
+    // 1. Check recent historical trades for symbol
+    let avgHistoricalPeakPct = 0;
+    try {
+        const pastTrades = db.prepare(`
+            SELECT trail_peak, long_entry, short_entry, trail_direction 
+            FROM pump_dump_trades 
+            WHERE symbol = ? AND status = 'closed' AND trail_peak IS NOT NULL 
+            ORDER BY created_at DESC LIMIT 15
+        `).all(symbol);
+
+        if (pastTrades.length > 0) {
+            const peakPcts = pastTrades.map(t => {
+                if (t.trail_direction === 'long' && t.long_entry > 0) {
+                    return Math.abs(t.trail_peak - t.long_entry) / t.long_entry;
+                } else if (t.trail_direction === 'short' && t.short_entry > 0) {
+                    return Math.abs(t.short_entry - t.trail_peak) / t.short_entry;
+                }
+                return 0;
+            }).filter(p => p > 0);
+
+            if (peakPcts.length > 0) {
+                avgHistoricalPeakPct = peakPcts.reduce((a, b) => a + b, 0) / peakPcts.length;
+            }
+        }
+    } catch (e) {
+        console.error('[Stats] Error querying trade history:', e.message);
+    }
+
+    // 2. Compute dynamic initial trail distance
+    // We want trail distance >= 1.8x live standard deviation (so noise doesn't stop us out)
+    // and adapted to ~50% of historical average expansion if available.
+    const volNoiseFloor = liveVol * 1.8;
+    const histTarget    = avgHistoricalPeakPct > 0 ? avgHistoricalPeakPct * 0.5 : 0.006;
+    let initialTrailPct = Math.max(volNoiseFloor, histTarget, TRAIL_INITIAL_PCT);
+    
+    // Clamp between 0.4% and 2.5%
+    initialTrailPct = Math.min(Math.max(initialTrailPct, 0.004), 0.025);
+
+    // Tightened trail is ~60% of initial trail
+    const tightTrailPct = Math.max(initialTrailPct * 0.6, TRAIL_TIGHT_PCT);
+
+    // 3. Trade Sizing:
+    // Uses exchange minimum order quantity
+    const minQty   = parseFloat(info.lotSizeFilter.minOrderQty);
+    const qtyDec   = getDecimals(info.lotSizeFilter.qtyStep);
+    const tradeQty = parseFloat(minQty.toFixed(qtyDec));
+
+    return {
+        initialTrailPct,
+        tightTrailPct,
+        tradeQty,
+        liveVolPct: (liveVol * 100).toFixed(2),
+        histAvgPct: (avgHistoricalPeakPct * 100).toFixed(2)
+    };
+}
+
 async function onPumpDetected(symbol, currentPrice, trade) {
     const info     = cachedInstrumentInfo[symbol];
     const tickSize = parseFloat(info.priceFilter.tickSize);
     const dec      = getDecimalPlaces(tickSize);
 
-    // Use exchange minimum qty — only this tiny slice is in play for the pump cycle.
-    // The rest of the large hedge position stays flat, protected by the 2% SL.
-    const minQty   = parseFloat(info.lotSizeFilter.minOrderQty);
-    const qtyDec   = getDecimals(info.lotSizeFilter.qtyStep);
-    const tradeQty = parseFloat(minQty.toFixed(qtyDec));
+    const dyn = calculateDynamicParams(symbol, currentPrice, 'long', trade);
+    const tradeQty = dyn.tradeQty;
+    const initialTrail = dyn.initialTrailPct;
 
-    // Estimate cut PnL on the minQty slice
+    // Estimate cut PnL on the slice
     const cutPnl = (trade.short_entry - currentPrice) * tradeQty;
 
-    // Initial server-tracked trail SL price
-    const trailSLPrice = parseFloat((Math.floor(currentPrice * (1 - TRAIL_INITIAL_PCT) / tickSize) * tickSize).toFixed(dec));
+    // Initial dynamic trail SL price
+    const trailSLPrice = parseFloat((Math.floor(currentPrice * (1 - initialTrail) / tickSize) * tickSize).toFixed(dec));
 
     // Mark as trailing before API calls to prevent race conditions
     db.prepare(`UPDATE pump_dump_trades SET status=?, trail_direction=?, trail_peak=?, trail_distance=?, trail_sl=?, cut_pnl=?, trade_qty=? WHERE symbol=?`)
-        .run('trailing_long', 'long', currentPrice, TRAIL_INITIAL_PCT, trailSLPrice, cutPnl, tradeQty, symbol);
+        .run('trailing_long', 'long', currentPrice, initialTrail, trailSLPrice, cutPnl, tradeQty, symbol);
     emitPdTradeUpdate(symbol);
     syncFromSQLite(db, 'pump_dump_trades', symbol);
 
-    // Close only minQty of the short (reduce-only) — the rest of the short hedge stays
+    // Close tradeQty of the short (reduce-only)
     const closeRes = await apiRequest('/v5/order/create', {
         category: 'linear', symbol, side: 'Buy', orderType: 'Market',
         qty: tradeQty.toString(), timeInForce: 'IOC', positionIdx: 2,
         reduceOnly: true, orderLinkId: `pd-cut-short-${Date.now()}-${symbol}`
     }, 'POST').catch(err => { console.error('[PD] Cut short failed:', err.message); return null; });
-    console.log(`[PD] Cut ${tradeQty} short (minQty):`, JSON.stringify(closeRes));
-
-    // NOTE: No Bybit native trailing-stop is set on the trail side.
-    // updateTrailingStop() compares live price vs trail_sl on every tick and
-    // fires a reduce-only minQty market order when the SL is breached.
+    console.log(`[PD] Cut ${tradeQty} short (vol: ${dyn.liveVolPct}%, histAvg: ${dyn.histAvgPct}%):`, JSON.stringify(closeRes));
 
     io.emit('signalEvent', {
         symbol, type: 'PUMP',
-        message: `🚀 PUMP! Cut ${tradeQty} short (Est: ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(4)} USDT). Trailing ${tradeQty} long from ${currentPrice.toFixed(4)} — SL: ${trailSLPrice}`,
+        message: `🚀 PUMP! Cut ${tradeQty} short. Dynamic Trail ${(initialTrail * 100).toFixed(2)}% (Vol: ${dyn.liveVolPct}%) from ${currentPrice.toFixed(4)} — SL: ${trailSLPrice}`,
         ts: Date.now()
     });
-    console.log(`[PD] Trailing long (minQty=${tradeQty}). Peak: ${currentPrice}, SL: ${trailSLPrice}, Cut est: ${cutPnl.toFixed(4)}`);
+    console.log(`[PD] Trailing long (qty=${tradeQty}). Peak: ${currentPrice}, SL: ${trailSLPrice}, TrailDist: ${(initialTrail * 100).toFixed(2)}%`);
 }
 
 async function onDumpDetected(symbol, currentPrice, trade) {
@@ -641,42 +707,36 @@ async function onDumpDetected(symbol, currentPrice, trade) {
     const tickSize = parseFloat(info.priceFilter.tickSize);
     const dec      = getDecimalPlaces(tickSize);
 
-    // Use exchange minimum qty — only this tiny slice is in play for the dump cycle.
-    // The rest of the large hedge position stays flat, protected by the 2% SL.
-    const minQty   = parseFloat(info.lotSizeFilter.minOrderQty);
-    const qtyDec   = getDecimals(info.lotSizeFilter.qtyStep);
-    const tradeQty = parseFloat(minQty.toFixed(qtyDec));
+    const dyn = calculateDynamicParams(symbol, currentPrice, 'short', trade);
+    const tradeQty = dyn.tradeQty;
+    const initialTrail = dyn.initialTrailPct;
 
-    // Estimate cut PnL on the minQty slice
+    // Estimate cut PnL on the slice
     const cutPnl = (currentPrice - trade.long_entry) * tradeQty;
 
-    // Initial server-tracked trail SL price
-    const trailSLPrice = parseFloat((Math.ceil(currentPrice * (1 + TRAIL_INITIAL_PCT) / tickSize) * tickSize).toFixed(dec));
+    // Initial dynamic trail SL price
+    const trailSLPrice = parseFloat((Math.ceil(currentPrice * (1 + initialTrail) / tickSize) * tickSize).toFixed(dec));
 
     // Mark as trailing before API calls
     db.prepare(`UPDATE pump_dump_trades SET status=?, trail_direction=?, trail_peak=?, trail_distance=?, trail_sl=?, cut_pnl=?, trade_qty=? WHERE symbol=?`)
-        .run('trailing_short', 'short', currentPrice, TRAIL_INITIAL_PCT, trailSLPrice, cutPnl, tradeQty, symbol);
+        .run('trailing_short', 'short', currentPrice, initialTrail, trailSLPrice, cutPnl, tradeQty, symbol);
     emitPdTradeUpdate(symbol);
     syncFromSQLite(db, 'pump_dump_trades', symbol);
 
-    // Close only minQty of the long (reduce-only) — the rest of the long hedge stays
+    // Close tradeQty of the long (reduce-only)
     const closeRes = await apiRequest('/v5/order/create', {
         category: 'linear', symbol, side: 'Sell', orderType: 'Market',
         qty: tradeQty.toString(), timeInForce: 'IOC', positionIdx: 1,
         reduceOnly: true, orderLinkId: `pd-cut-long-${Date.now()}-${symbol}`
     }, 'POST').catch(err => { console.error('[PD] Cut long failed:', err.message); return null; });
-    console.log(`[PD] Cut ${tradeQty} long (minQty):`, JSON.stringify(closeRes));
-
-    // NOTE: No Bybit native trailing-stop is set on the trail side.
-    // updateTrailingStop() compares live price vs trail_sl on every tick and
-    // fires a reduce-only minQty market order when the SL is breached.
+    console.log(`[PD] Cut ${tradeQty} long (vol: ${dyn.liveVolPct}%, histAvg: ${dyn.histAvgPct}%):`, JSON.stringify(closeRes));
 
     io.emit('signalEvent', {
         symbol, type: 'DUMP',
-        message: `📉 DUMP! Cut ${tradeQty} long (Est: ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(4)} USDT). Trailing ${tradeQty} short from ${currentPrice.toFixed(4)} — SL: ${trailSLPrice}`,
+        message: `📉 DUMP! Cut ${tradeQty} long. Dynamic Trail ${(initialTrail * 100).toFixed(2)}% (Vol: ${dyn.liveVolPct}%) from ${currentPrice.toFixed(4)} — SL: ${trailSLPrice}`,
         ts: Date.now()
     });
-    console.log(`[PD] Trailing short (minQty=${tradeQty}). Peak: ${currentPrice}, SL: ${trailSLPrice}, Cut est: ${cutPnl.toFixed(4)}`);
+    console.log(`[PD] Trailing short (qty=${tradeQty}). Peak: ${currentPrice}, SL: ${trailSLPrice}, TrailDist: ${(initialTrail * 100).toFixed(2)}%`);
 }
 
 // Trailing stop manager — called on every price tick
@@ -700,7 +760,9 @@ async function updateTrailingStop(symbol, currentPrice) {
         if (currentPrice > (trade.trail_peak || 0)) {
             // New peak — advance the trailing SL upward
             const profitPct = trade.long_entry > 0 ? (currentPrice - trade.long_entry) / trade.long_entry : 0;
-            const trailDist = profitPct >= 0.01 ? TRAIL_TIGHT_PCT : TRAIL_INITIAL_PCT;
+            const baseDist  = trade.trail_distance || TRAIL_INITIAL_PCT;
+            // Tighten to ~60% of base distance once profit exceeds 1.5x base distance
+            const trailDist = profitPct >= (baseDist * 1.5) ? Math.max(baseDist * 0.6, TRAIL_TIGHT_PCT) : baseDist;
             const newSL     = parseFloat((Math.floor(currentPrice * (1 - trailDist) / tickSize) * tickSize).toFixed(dec));
 
             if (!trade.trail_sl || newSL > trade.trail_sl) {
@@ -710,11 +772,11 @@ async function updateTrailingStop(symbol, currentPrice) {
                         .run(currentPrice, newSL, trailDist, symbol);
                     emitPdTradeUpdate(symbol);
                     syncFromSQLite(db, 'pump_dump_trades', symbol);
-                    console.log(`\x1b[32m[Trail] Long: peak=${currentPrice.toFixed(4)}, SL=${newSL} (dist=${(trailDist*100).toFixed(1)}%)\x1b[0m`);
+                    console.log(`\x1b[32m[Trail] Long: peak=${currentPrice.toFixed(4)}, SL=${newSL} (dist=${(trailDist*100).toFixed(2)}%, profit=${(profitPct*100).toFixed(2)}%)\x1b[0m`);
                 }
             }
         } else if (trade.trail_sl && currentPrice <= trade.trail_sl) {
-            // ✅ Trail SL hit — close minQty of long reduce-only
+            // ✅ Trail SL hit — close tradeQty of long reduce-only
             trailClosingFlags[symbol] = true;
             console.log(`[PD] Long trail SL hit @ ${currentPrice.toFixed(4)} (SL was ${trade.trail_sl}). Closing ${tradeQty} long...`);
             db.prepare('UPDATE pump_dump_trades SET status=? WHERE symbol=?').run('closing', symbol);
@@ -741,7 +803,9 @@ async function updateTrailingStop(symbol, currentPrice) {
         if (currentPrice < (trade.trail_peak || Infinity)) {
             // New low — advance the trailing SL downward
             const profitPct = trade.short_entry > 0 ? (trade.short_entry - currentPrice) / trade.short_entry : 0;
-            const trailDist = profitPct >= 0.01 ? TRAIL_TIGHT_PCT : TRAIL_INITIAL_PCT;
+            const baseDist  = trade.trail_distance || TRAIL_INITIAL_PCT;
+            // Tighten to ~60% of base distance once profit exceeds 1.5x base distance
+            const trailDist = profitPct >= (baseDist * 1.5) ? Math.max(baseDist * 0.6, TRAIL_TIGHT_PCT) : baseDist;
             const newSL     = parseFloat((Math.ceil(currentPrice * (1 + trailDist) / tickSize) * tickSize).toFixed(dec));
 
             if (!trade.trail_sl || newSL < trade.trail_sl) {
@@ -751,11 +815,11 @@ async function updateTrailingStop(symbol, currentPrice) {
                         .run(currentPrice, newSL, trailDist, symbol);
                     emitPdTradeUpdate(symbol);
                     syncFromSQLite(db, 'pump_dump_trades', symbol);
-                    console.log(`\x1b[31m[Trail] Short: peak=${currentPrice.toFixed(4)}, SL=${newSL} (dist=${(trailDist*100).toFixed(1)}%)\x1b[0m`);
+                    console.log(`\x1b[31m[Trail] Short: peak=${currentPrice.toFixed(4)}, SL=${newSL} (dist=${(trailDist*100).toFixed(2)}%, profit=${(profitPct*100).toFixed(2)}%)\x1b[0m`);
                 }
             }
         } else if (trade.trail_sl && currentPrice >= trade.trail_sl) {
-            // ✅ Trail SL hit — close minQty of short reduce-only
+            // ✅ Trail SL hit — close tradeQty of short reduce-only
             trailClosingFlags[symbol] = true;
             console.log(`[PD] Short trail SL hit @ ${currentPrice.toFixed(4)} (SL was ${trade.trail_sl}). Closing ${tradeQty} short...`);
             db.prepare('UPDATE pump_dump_trades SET status=? WHERE symbol=?').run('closing', symbol);
