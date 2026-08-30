@@ -565,31 +565,30 @@ async function checkCircuitBreaker(symbol, positions) {
     }
 }
 
-let isPumpDumpDetecting = false;
+const symbolLocks = {}; // Per-symbol lock to prevent overlapping trade actions
+
 async function handleSignalScore(symbol, pumpScore, dumpScore, currentPrice) {
-    if (isPumpDumpDetecting) return;
+    if (symbolLocks[symbol]) return;
     const trade = db.prepare('SELECT * FROM pump_dump_trades WHERE symbol = ?').get(symbol);
     if (!trade || trade.status !== 'hedged') return;
 
     if (pumpScore >= SIGNAL_THRESHOLD) {
-        isPumpDumpDetecting = true;
+        symbolLocks[symbol] = true;
         console.log(`\x1b[32m[PD] 🚀 PUMP detected! ${symbol} score: ${pumpScore}/${SIGNAL_THRESHOLD}\x1b[0m`);
         try {
             await onPumpDetected(symbol, currentPrice, trade);
         } catch (err) {
             console.error('[PD] onPumpDetected error:', err.message);
-        } finally {
-            setTimeout(() => { isPumpDumpDetecting = false; }, 5000);
+            symbolLocks[symbol] = false;
         }
     } else if (dumpScore >= SIGNAL_THRESHOLD) {
-        isPumpDumpDetecting = true;
+        symbolLocks[symbol] = true;
         console.log(`\x1b[31m[PD] 📉 DUMP detected! ${symbol} score: ${dumpScore}/${SIGNAL_THRESHOLD}\x1b[0m`);
         try {
             await onDumpDetected(symbol, currentPrice, trade);
         } catch (err) {
             console.error('[PD] onDumpDetected error:', err.message);
-        } finally {
-            setTimeout(() => { isPumpDumpDetecting = false; }, 5000);
+            symbolLocks[symbol] = false;
         }
     }
 }
@@ -825,20 +824,59 @@ async function finalizeTradeAfterExit(symbol, pdTrade, exitPrice) {
         totalPnl = cutPnl + trailPnl;
     }
 
-    db.prepare('UPDATE pump_dump_trades SET status=?, trail_pnl=?, total_pnl=?, close_price=? WHERE symbol=?')
-        .run('closed', trailPnl, totalPnl, closePrice, symbol);
-    db.prepare('DELETE FROM active_trades WHERE symbol=?').run(symbol);
-    emitPdTradeUpdate(symbol);
-    emitLegUpdate(symbol);
-    // Persist final state to MongoDB
-    syncFromSQLite(db, 'pump_dump_trades', symbol);
-    deleteDoc('active_trades', symbol);
-    io.emit('signalEvent', {
-        symbol,
-        type: 'CLOSE',
-        message: `✓ Trade closed! Net Bybit PnL: ${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(4)} USDT (Cut leg: ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(4)}, Trail leg: ${trailPnl >= 0 ? '+' : ''}${trailPnl.toFixed(4)})`,
-        ts: Date.now()
-    });
+    // Check remaining positions on Bybit to decide if we continue trading
+    const remainingPositions = await getPositions(symbol);
+    const longPos  = remainingPositions.find(p => p.side === 'Buy' && parseFloat(p.size) > 0);
+    const shortPos = remainingPositions.find(p => p.side === 'Sell' && parseFloat(p.size) > 0);
+
+    const hasBothPositions = !!(longPos && shortPos);
+
+    if (hasBothPositions) {
+        // Both sides still exist — automatically loop and continue trading
+        const newLongEntry  = parseFloat(longPos.avgPrice || pdTrade.long_entry);
+        const newShortEntry = parseFloat(shortPos.avgPrice || pdTrade.short_entry);
+        const minPosSize    = Math.min(parseFloat(longPos.size), parseFloat(shortPos.size));
+
+        db.prepare(`
+            UPDATE pump_dump_trades 
+            SET status='hedged', long_entry=?, short_entry=?, qty=?,
+                trail_direction=NULL, trail_peak=NULL, trail_sl=NULL,
+                cut_pnl=0, trail_pnl=?, total_pnl=?, close_price=?, created_at=?
+            WHERE symbol=?
+        `).run(newLongEntry, newShortEntry, minPosSize, trailPnl, totalPnl, closePrice, Date.now(), symbol);
+
+        emitPdTradeUpdate(symbol);
+        emitLegUpdate(symbol);
+        syncFromSQLite(db, 'pump_dump_trades', symbol);
+
+        io.emit('signalEvent', {
+            symbol,
+            type: 'CLOSE',
+            message: `✓ Cycle finished! Net PnL: ${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(4)} USDT (Cut: ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(4)}, Trail: ${trailPnl >= 0 ? '+' : ''}${trailPnl.toFixed(4)}). 🔄 Continuing trading with remaining Long (${longPos.size}) & Short (${shortPos.size})...`,
+            ts: Date.now()
+        });
+        console.log(`[PD] Cycle finished for ${symbol}. Remaining positions found (Long: ${longPos.size}, Short: ${shortPos.size}). Resuming 'hedged' state.`);
+    } else {
+        // One or both positions closed — complete the trade session
+        db.prepare('UPDATE pump_dump_trades SET status=?, trail_pnl=?, total_pnl=?, close_price=? WHERE symbol=?')
+            .run('closed', trailPnl, totalPnl, closePrice, symbol);
+        db.prepare('DELETE FROM active_trades WHERE symbol=?').run(symbol);
+        emitPdTradeUpdate(symbol);
+        emitLegUpdate(symbol);
+        syncFromSQLite(db, 'pump_dump_trades', symbol);
+        deleteDoc('active_trades', symbol);
+
+        io.emit('signalEvent', {
+            symbol,
+            type: 'CLOSE',
+            message: `🏁 Finished trading! No more dual positions remaining. Final Net PnL: ${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(4)} USDT`,
+            ts: Date.now()
+        });
+        console.log(`[PD] Finished trading for ${symbol}. Both positions are no longer open.`);
+    }
+
+    // Release lock for this symbol so next cycle can process safely
+    delete symbolLocks[symbol];
 }
 
 // ─── Startup Recovery ─────────────────────────────────────
@@ -1328,6 +1366,7 @@ io.on('connection', (socket) => {
     // ── STOP: cancel monitoring + orders (positions stay open) ──
     socket.on('stopTrading', async ({ symbol }) => {
         if (!symbol) return;
+        delete symbolLocks[symbol];
         console.log(`[IO] Stop requested for ${symbol}`);
         try {
             db.transaction(() => {
@@ -1351,6 +1390,7 @@ io.on('connection', (socket) => {
     // ── CLOSE: close all positions + cancel everything ─────
     socket.on('closePositions', async ({ symbol }) => {
         if (!symbol) return;
+        delete symbolLocks[symbol];
         console.log(`[IO] Close positions requested for ${symbol}`);
         try {
             db.transaction(() => {
