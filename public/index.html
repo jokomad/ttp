@@ -644,6 +644,13 @@
 
     socket.on('symbolList', list => { symbolList = list; });
 
+    socket.on('activeSymbol', ({ symbol }) => {
+        if (!currentSymbol && symbol) {
+            console.log('[UI] Auto-selecting active symbol:', symbol);
+            selectSymbol(symbol);
+        }
+    });
+
     socket.on('wsStatus', ({ connected, symbol, reason }) => {
         const bar = document.getElementById('ws-bar');
         if (connected) {
@@ -991,23 +998,34 @@
 
     // ── Actions ──────────────────────────────────────────
     function startTrading() {
-        if (currentSymbol) socket.emit('startTrading', { symbol: currentSymbol });
+        if (!currentSymbol) {
+            const bar = document.getElementById('ws-bar');
+            bar.className = 'warn';
+            bar.textContent = 'Please search and select a symbol first.';
+            return;
+        }
+        const bar = document.getElementById('ws-bar');
+        bar.className = 'ok';
+        bar.textContent = `Starting hedge for ${currentSymbol}...`;
+        socket.emit('startTrading', { symbol: currentSymbol });
     }
 
     function stopTrading() {
-        if (currentSymbol) {
-            socket.emit('stopTrading', { symbol: currentSymbol });
-            // Reset session statistics on stop
-            resetSessionStats(currentSymbol);
-        }
+        if (!currentSymbol) return;
+        const bar = document.getElementById('ws-bar');
+        bar.className = 'warn';
+        bar.textContent = `Stopping ${currentSymbol}...`;
+        socket.emit('stopTrading', { symbol: currentSymbol });
+        resetSessionStats(currentSymbol);
     }
 
     function closePositions() {
-        if (currentSymbol) {
-            socket.emit('closePositions', { symbol: currentSymbol });
-            // Reset session statistics on close all
-            resetSessionStats(currentSymbol);
-        }
+        if (!currentSymbol) return;
+        const bar = document.getElementById('ws-bar');
+        bar.className = 'warn';
+        bar.textContent = `Closing all positions for ${currentSymbol}...`;
+        socket.emit('closePositions', { symbol: currentSymbol });
+        resetSessionStats(currentSymbol);
     }
 
     // ── Search ───────────────────────────────────────────
