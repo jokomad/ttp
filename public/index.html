@@ -673,8 +673,8 @@
 
     socket.on('signalUpdate', ({ symbol, pump, dump, details, maxSignals }) => {
         if (symbol !== currentSymbol) return;
-        updateGauge('pump', pump, maxSignals, pump >= 4);
-        updateGauge('dump', dump, maxSignals, dump >= 4);
+        updateGauge('pump', pump, maxSignals, pump >= 5);
+        updateGauge('dump', dump, maxSignals, dump >= 5);
         const tagsEl = document.getElementById('signal-tags');
         tagsEl.innerHTML = details.map(d =>
             `<span class="sig-tag sig-tag-${d.d}">${d.s}: ${d.v}</span>`
