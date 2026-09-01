@@ -672,17 +672,18 @@ async function onPumpDetected(symbol, currentPrice, trade) {
 
     const dyn = calculateDynamicParams(symbol, currentPrice, 'long', trade);
     const tradeQty = dyn.tradeQty;
-    const initialTrail = dyn.initialTrailPct;
+    // Cap initial stop loss leash at 0.35% max to prevent fakeout bleed
+    const initialTrail = Math.min(dyn.initialTrailPct, 0.0035);
 
     // Estimate cut PnL on the slice
     const cutPnl = (trade.short_entry - currentPrice) * tradeQty;
 
-    // Initial dynamic trail SL price
+    // Initial dynamic trail SL price (tight floor near cut price)
     const trailSLPrice = parseFloat((Math.floor(currentPrice * (1 - initialTrail) / tickSize) * tickSize).toFixed(dec));
 
     // For this trailing cycle, record long_entry as currentPrice (the cut price baseline)
-    db.prepare(`UPDATE pump_dump_trades SET status=?, trail_direction=?, trail_peak=?, trail_distance=?, trail_sl=?, cut_pnl=?, trade_qty=?, long_entry=? WHERE symbol=?`)
-        .run('trailing_long', 'long', currentPrice, initialTrail, trailSLPrice, cutPnl, tradeQty, currentPrice, symbol);
+    db.prepare(`UPDATE pump_dump_trades SET status=?, trail_direction=?, trail_peak=?, trail_distance=?, trail_sl=?, cut_pnl=?, trade_qty=?, long_entry=?, created_at=? WHERE symbol=?`)
+        .run('trailing_long', 'long', currentPrice, initialTrail, trailSLPrice, cutPnl, tradeQty, currentPrice, Date.now(), symbol);
     emitPdTradeUpdate(symbol);
     syncFromSQLite(db, 'pump_dump_trades', symbol);
 
@@ -696,10 +697,10 @@ async function onPumpDetected(symbol, currentPrice, trade) {
 
     io.emit('signalEvent', {
         symbol, type: 'PUMP',
-        message: `🚀 PUMP! Cut ${tradeQty} short @ ${currentPrice.toFixed(4)}. Dynamic Trail ${(initialTrail * 100).toFixed(2)}% — SL: ${trailSLPrice}`,
+        message: `🚀 PUMP! Cut ${tradeQty} short @ ${currentPrice.toFixed(4)}. Tight Trail ${(initialTrail * 100).toFixed(2)}% — SL: ${trailSLPrice}`,
         ts: Date.now()
     });
-    console.log(`[PD] Trailing long (qty=${tradeQty}). Cut/Baseline: ${currentPrice}, Initial SL: ${trailSLPrice}, TrailDist: ${(initialTrail * 100).toFixed(2)}%`);
+    console.log(`[PD] Trailing long (qty=${tradeQty}). Cut/Baseline: ${currentPrice}, Initial SL: ${trailSLPrice}`);
 }
 
 async function onDumpDetected(symbol, currentPrice, trade) {
@@ -709,17 +710,18 @@ async function onDumpDetected(symbol, currentPrice, trade) {
 
     const dyn = calculateDynamicParams(symbol, currentPrice, 'short', trade);
     const tradeQty = dyn.tradeQty;
-    const initialTrail = dyn.initialTrailPct;
+    // Cap initial stop loss leash at 0.35% max to prevent fakeout bleed
+    const initialTrail = Math.min(dyn.initialTrailPct, 0.0035);
 
     // Estimate cut PnL on the slice
     const cutPnl = (currentPrice - trade.long_entry) * tradeQty;
 
-    // Initial dynamic trail SL price
+    // Initial dynamic trail SL price (tight ceiling near cut price)
     const trailSLPrice = parseFloat((Math.ceil(currentPrice * (1 + initialTrail) / tickSize) * tickSize).toFixed(dec));
 
     // For this trailing cycle, record short_entry as currentPrice (the cut price baseline)
-    db.prepare(`UPDATE pump_dump_trades SET status=?, trail_direction=?, trail_peak=?, trail_distance=?, trail_sl=?, cut_pnl=?, trade_qty=?, short_entry=? WHERE symbol=?`)
-        .run('trailing_short', 'short', currentPrice, initialTrail, trailSLPrice, cutPnl, tradeQty, currentPrice, symbol);
+    db.prepare(`UPDATE pump_dump_trades SET status=?, trail_direction=?, trail_peak=?, trail_distance=?, trail_sl=?, cut_pnl=?, trade_qty=?, short_entry=?, created_at=? WHERE symbol=?`)
+        .run('trailing_short', 'short', currentPrice, initialTrail, trailSLPrice, cutPnl, tradeQty, currentPrice, Date.now(), symbol);
     emitPdTradeUpdate(symbol);
     syncFromSQLite(db, 'pump_dump_trades', symbol);
 
@@ -733,10 +735,10 @@ async function onDumpDetected(symbol, currentPrice, trade) {
 
     io.emit('signalEvent', {
         symbol, type: 'DUMP',
-        message: `📉 DUMP! Cut ${tradeQty} long @ ${currentPrice.toFixed(4)}. Dynamic Trail ${(initialTrail * 100).toFixed(2)}% — SL: ${trailSLPrice}`,
+        message: `📉 DUMP! Cut ${tradeQty} long @ ${currentPrice.toFixed(4)}. Tight Trail ${(initialTrail * 100).toFixed(2)}% — SL: ${trailSLPrice}`,
         ts: Date.now()
     });
-    console.log(`[PD] Trailing short (qty=${tradeQty}). Cut/Baseline: ${currentPrice}, Initial SL: ${trailSLPrice}, TrailDist: ${(initialTrail * 100).toFixed(2)}%`);
+    console.log(`[PD] Trailing short (qty=${tradeQty}). Cut/Baseline: ${currentPrice}, Initial SL: ${trailSLPrice}`);
 }
 
 // Trailing stop manager — called on every price tick
@@ -754,36 +756,41 @@ async function updateTrailingStop(symbol, currentPrice) {
     const tickSize = parseFloat(info.priceFilter.tickSize);
     const dec      = getDecimalPlaces(tickSize);
     const tradeQty = trade.trade_qty || parseFloat(info.lotSizeFilter.minOrderQty);
+    const elapsedSeconds = trade.created_at ? (now - trade.created_at) / 1000 : 0;
 
     if (trade.trail_direction === 'long') {
         // ── Long trail (benchmarked from cut baseline) ──────────────────────
         const cutPrice  = trade.long_entry > 0 ? trade.long_entry : currentPrice;
         const profitPct = cutPrice > 0 ? (currentPrice - cutPrice) / cutPrice : 0;
-        const baseDist  = trade.trail_distance || 0.010;
+        const baseDist  = trade.trail_distance || 0.0035;
         
         let targetSL = 0;
         let trailDist = baseDist;
 
-        // Stage 3: Mega-Run (> +1.5% from cut) — Tighten leash to 0.3% behind peak
-        if (profitPct >= 0.015) {
-            trailDist = 0.003;
+        // Stage 3: Peak Harvest (> +0.80% from cut) — Trail tightly 0.25% behind peak
+        if (profitPct >= 0.0080) {
+            trailDist = 0.0025;
             targetSL = currentPrice * (1 - trailDist);
         }
-        // Stage 2: Net Profit Lock (> +0.8% from cut) — Lock minimum +0.5% gain
-        else if (profitPct >= 0.008) {
-            const minGuaranteed = cutPrice * 1.005; // Cut + 0.5% profit
+        // Stage 2: Net Profit Lock (> +0.50% from cut) — Lock minimum +0.30% gain
+        else if (profitPct >= 0.0050) {
+            const minGuaranteed = cutPrice * 1.0030; // Cut + 0.30% pure profit
             const trailingCalc  = currentPrice * (1 - baseDist);
             targetSL = Math.max(minGuaranteed, trailingCalc);
         }
-        // Stage 1: Breakeven Arming (> +0.4% from cut) — Lock SL at Cut Price
-        else if (profitPct >= 0.004) {
+        // Stage 1: Breakeven Arming (> +0.25% from cut) — Lock SL at Cut Price + fee buffer
+        else if (profitPct >= 0.0025) {
             const breakevenSL   = cutPrice * 1.0005; // Cut + 0.05% fee buffer
             const trailingCalc  = currentPrice * (1 - baseDist);
             targetSL = Math.max(breakevenSL, trailingCalc);
         }
-        // Initial wide trailing
+        // Stall Guard: If trade stalls for > 35s without hitting +0.20%, arm breakeven
+        else if (elapsedSeconds > 35 && profitPct > 0) {
+            targetSL = cutPrice * 1.0002;
+        }
+        // Initial tight floor (capped at -0.35% from cut)
         else {
-            targetSL = currentPrice * (1 - baseDist);
+            targetSL = Math.max(cutPrice * (1 - 0.0035), currentPrice * (1 - baseDist));
         }
 
         const newSL = parseFloat((Math.floor(targetSL / tickSize) * tickSize).toFixed(dec));
@@ -837,31 +844,35 @@ async function updateTrailingStop(symbol, currentPrice) {
         // ── Short trail (benchmarked from cut baseline) ─────────────────────
         const cutPrice  = trade.short_entry > 0 ? trade.short_entry : currentPrice;
         const profitPct = cutPrice > 0 ? (cutPrice - currentPrice) / cutPrice : 0;
-        const baseDist  = trade.trail_distance || 0.010;
+        const baseDist  = trade.trail_distance || 0.0035;
         
         let targetSL = 0;
         let trailDist = baseDist;
 
-        // Stage 3: Mega-Run (> +1.5% from cut) — Tighten leash to 0.3% behind peak
-        if (profitPct >= 0.015) {
-            trailDist = 0.003;
+        // Stage 3: Peak Harvest (> +0.80% from cut) — Trail tightly 0.25% behind peak
+        if (profitPct >= 0.0080) {
+            trailDist = 0.0025;
             targetSL = currentPrice * (1 + trailDist);
         }
-        // Stage 2: Net Profit Lock (> +0.8% from cut) — Lock minimum +0.5% gain
-        else if (profitPct >= 0.008) {
-            const minGuaranteed = cutPrice * 0.995; // Cut - 0.5% profit
+        // Stage 2: Net Profit Lock (> +0.50% from cut) — Lock minimum +0.30% gain
+        else if (profitPct >= 0.0050) {
+            const minGuaranteed = cutPrice * 0.9970; // Cut - 0.30% pure profit
             const trailingCalc  = currentPrice * (1 + baseDist);
             targetSL = Math.min(minGuaranteed, trailingCalc);
         }
-        // Stage 1: Breakeven Arming (> +0.4% from cut) — Lock SL at Cut Price
-        else if (profitPct >= 0.004) {
+        // Stage 1: Breakeven Arming (> +0.25% from cut) — Lock SL at Cut Price - fee buffer
+        else if (profitPct >= 0.0025) {
             const breakevenSL   = cutPrice * 0.9995; // Cut - 0.05% fee buffer
             const trailingCalc  = currentPrice * (1 + baseDist);
             targetSL = Math.min(breakevenSL, trailingCalc);
         }
-        // Initial wide trailing
+        // Stall Guard: If trade stalls for > 35s without hitting +0.20%, arm breakeven
+        else if (elapsedSeconds > 35 && profitPct > 0) {
+            targetSL = cutPrice * 0.9998;
+        }
+        // Initial tight ceiling (capped at +0.35% from cut)
         else {
-            targetSL = currentPrice * (1 + baseDist);
+            targetSL = Math.min(cutPrice * (1 + 0.0035), currentPrice * (1 + baseDist));
         }
 
         const newSL = parseFloat((Math.ceil(targetSL / tickSize) * tickSize).toFixed(dec));
