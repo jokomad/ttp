@@ -1488,9 +1488,22 @@ function handlePrivateOrderUpdate(list) {
 }
 
 // ─── Socket.io ────────────────────────────────────────────
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
     console.log('[IO] Client connected:', socket.id);
     socket.emit('symbolList', Object.keys(cachedInstrumentInfo).sort());
+
+    // If there is an active running trade, push its state immediately so the UI auto-loads
+    const active = db.prepare('SELECT * FROM active_trades LIMIT 1').get();
+    const activeSym = active?.symbol || wsSymbol;
+    if (activeSym) {
+        socket.emit('activeSymbol', { symbol: activeSym });
+        if (lastValidPrice !== null) {
+            socket.emit('livePrice', buildPayload(activeSym, lastValidPrice));
+        }
+        socket.emit('positions', { symbol: activeSym, list: await getPositions(activeSym) });
+        emitLegUpdate(activeSym);
+        emitPdTradeUpdate(activeSym);
+    }
 
     socket.on('watchSymbol', async (symbol) => {
         if (!cachedInstrumentInfo[symbol]) {
@@ -1512,28 +1525,21 @@ io.on('connection', (socket) => {
         emitPdTradeUpdate(symbol);
     });
 
-    // ── START: open 5 USDT long + short hedge ─────────────
+    // ── START: open 5 USDT long + short hedge (or adopt existing) ──
     socket.on('startTrading', async ({ symbol }) => {
         if (!symbol) return;
         const info = cachedInstrumentInfo[symbol];
         if (!info) { socket.emit('wsWarning', { symbol, message: 'Instrument info not ready.' }); return; }
 
-        // Check if a pd-trade is already active
-        const existing = db.prepare('SELECT * FROM pump_dump_trades WHERE symbol = ?').get(symbol);
-        if (existing && existing.status !== 'closed') {
-            socket.emit('wsWarning', { symbol, message: 'A trade is already active. STOP it first.' });
-            return;
-        }
-
         // Resolve price: prefer live WS price; fall back to REST for slow/low-volume pairs
         let price = lastValidPrice;
         if (!price) {
-            socket.emit('wsWarning', { symbol, message: 'No live price yet — fetching from REST...' });
+            socket.emit('wsWarning', { symbol, message: 'Fetching live market price...' });
             try {
                 const tickerRes = await apiRequest('/v5/market/tickers', { category: 'linear', symbol });
                 if (tickerRes.retCode === 0 && tickerRes.result?.list?.[0]) {
                     price = validatePrice(tickerRes.result.list[0].lastPrice);
-                    if (price) lastValidPrice = price; // seed for future use
+                    if (price) lastValidPrice = price;
                 }
             } catch (e) {
                 console.error('[Start] REST price fetch failed:', e.message);
@@ -1546,18 +1552,40 @@ io.on('connection', (socket) => {
         }
 
         try {
+            // Check live positions on Bybit first
+            const existingPositions = await getPositions(symbol);
+            const hasLong  = existingPositions.some(p => p.side === 'Buy'  && parseFloat(p.size) > 0);
+            const hasShort = existingPositions.some(p => p.side === 'Sell' && parseFloat(p.size) > 0);
+
+            let qty = 0;
+            let longEntry = price;
+            let shortEntry = price;
+
+            if (hasLong && hasShort) {
+                // Adopt existing open dual positions on Bybit
+                const longPos  = existingPositions.find(p => p.side === 'Buy');
+                const shortPos = existingPositions.find(p => p.side === 'Sell');
+                longEntry  = parseFloat(longPos.avgPrice || price);
+                shortEntry = parseFloat(shortPos.avgPrice || price);
+                qty        = Math.min(parseFloat(longPos.size), parseFloat(shortPos.size));
+
+                io.emit('wsWarning', { symbol, message: `Adopting existing ${symbol} hedge (Long: ${longPos.size}, Short: ${shortPos.size}). Starting cycle...` });
+            } else {
+                // Open new hedge positions
+                dbAddActiveTrade(symbol);
+                io.emit('wsWarning', { symbol, message: `Opening ${HEDGE_MARGIN_USDT} USDT long + short hedge at ${HEDGE_LEVERAGE}× leverage...` });
+
+                qty = await openHedgePositions(symbol, price, info);
+
+                // Wait for market order fills
+                await new Promise(r => setTimeout(r, 2500));
+
+                const positions  = await getPositions(symbol);
+                longEntry  = parseFloat(positions.find(p => p.side === 'Buy')?.avgPrice  || price);
+                shortEntry = parseFloat(positions.find(p => p.side === 'Sell')?.avgPrice || price);
+            }
+
             dbAddActiveTrade(symbol);
-            io.emit('wsWarning', { symbol, message: `Opening ${HEDGE_MARGIN_USDT} USDT long + short hedge at ${HEDGE_LEVERAGE}× leverage...` });
-
-            const qty = await openHedgePositions(symbol, price, info);
-
-            // Wait for market order fills
-            await new Promise(r => setTimeout(r, 2500));
-
-            const positions  = await getPositions(symbol);
-            const longEntry  = parseFloat(positions.find(p => p.side === 'Buy')?.avgPrice  || price);
-            const shortEntry = parseFloat(positions.find(p => p.side === 'Sell')?.avgPrice || price);
-
             db.prepare(`
                 INSERT OR REPLACE INTO pump_dump_trades
                 (symbol, long_entry, short_entry, qty, long_sl, short_sl, status, trail_direction, trail_distance, trail_peak, trail_sl, created_at)
@@ -1569,16 +1597,18 @@ io.on('connection', (socket) => {
             // Persist new trade to MongoDB
             syncFromSQLite(db, 'active_trades', symbol);
             syncFromSQLite(db, 'pump_dump_trades', symbol);
-            io.emit('positions', { symbol, list: positions });
+            
+            const currentPositions = await getPositions(symbol);
+            io.emit('positions', { symbol, list: currentPositions });
             io.emit('signalEvent', {
                 symbol, type: 'START',
-                message: `Hedge open: Long @ ${longEntry.toFixed(4)} / Short @ ${shortEntry.toFixed(4)} | Qty: ${qty} (no SL — minQty cycling)`,
+                message: `✓ Hedge active: Long @ ${longEntry.toFixed(4)} / Short @ ${shortEntry.toFixed(4)} | Qty: ${qty} — Scanning momentum...`,
                 ts: Date.now()
             });
             console.log(`[IO] Hedge active for ${symbol}. Long: ${longEntry} | Short: ${shortEntry} | Qty: ${qty}`);
         } catch (err) {
             console.error('[Start] Error:', err.message);
-            socket.emit('wsWarning', { symbol, message: `Failed to open hedge: ${err.message}` });
+            socket.emit('wsWarning', { symbol, message: `Start failed: ${err.message}` });
         }
     });
 
