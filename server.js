@@ -33,9 +33,9 @@ if (!API_KEY || !API_SECRET) {
 const HEDGE_MARGIN_USDT = 5;        // 5 USDT margin per side
 const HEDGE_LEVERAGE    = 5;        // 5× leverage → 25 USDT notional per side
 const TRAIL_INITIAL_PCT = 0.005;    // 0.5% initial trailing distance
-const TRAIL_TIGHT_PCT   = 0.003;    // 0.3% trail distance after 1% profit
+const TRAIL_TIGHT_PCT   = 0.0035;   // 0.35% trail distance on runners
 const CIRCUIT_BREAKER   = 0.03;     // close both if combined loss >= 3% of notional
-const SIGNAL_THRESHOLD  = 4;        // signals needed out of 6 to fire pump/dump
+const SIGNAL_THRESHOLD  = 5;        // signals needed out of 7 to fire pump/dump (strict momentum filter)
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -742,9 +742,51 @@ async function onDumpDetected(symbol, currentPrice, trade) {
 }
 
 // Trailing stop manager — called on every price tick
+// Trailing stop manager — called on every price tick
 // Server-managed: detects SL breach and fires reduce-only minQty market order.
 const lastTrailUpdate   = {};
 const trailClosingFlags = {};  // prevents duplicate close orders per symbol
+const activeLimitTPs    = {};  // symbol → orderId for Stage 2 Maker Limit TP
+
+async function placeLimitTPOrder(symbol, side, price, qty, positionIdx) {
+    try {
+        const info = cachedInstrumentInfo[symbol];
+        if (!info) return null;
+        const tickSize = parseFloat(info.priceFilter.tickSize);
+        const dec = getDecimalPlaces(tickSize);
+        const roundedPrice = (Math.round(price / tickSize) * tickSize).toFixed(dec);
+
+        const res = await apiRequest('/v5/order/create', {
+            category: 'linear',
+            symbol,
+            side,
+            orderType: 'Limit',
+            price: roundedPrice,
+            qty: qty.toString(),
+            timeInForce: 'PostOnly',
+            positionIdx,
+            reduceOnly: true,
+            orderLinkId: `pd-tp-${Date.now()}-${symbol}`
+        }, 'POST');
+
+        if (res.retCode === 0 && res.result?.orderId) {
+            console.log(`[TP] Placed Post-Only Maker Limit TP for ${symbol} @ ${roundedPrice}: orderId=${res.result.orderId}`);
+            return res.result.orderId;
+        }
+    } catch (err) {
+        console.error(`[TP] Failed to place Limit TP for ${symbol}:`, err.message);
+    }
+    return null;
+}
+
+async function cancelActiveLimitTP(symbol) {
+    if (activeLimitTPs[symbol]) {
+        const orderId = activeLimitTPs[symbol];
+        delete activeLimitTPs[symbol];
+        await apiRequest('/v5/order/cancel', { category: 'linear', symbol, orderId }, 'POST').catch(() => {});
+    }
+}
+
 async function updateTrailingStop(symbol, currentPrice) {
     const trade = db.prepare('SELECT * FROM pump_dump_trades WHERE symbol = ?').get(symbol);
     if (!trade || (trade.status !== 'trailing_long' && trade.status !== 'trailing_short')) return;
@@ -767,26 +809,34 @@ async function updateTrailingStop(symbol, currentPrice) {
         let targetSL = 0;
         let trailDist = baseDist;
 
-        // Stage 3: Peak Harvest (> +0.80% from cut) — Trail tightly 0.25% behind peak
-        if (profitPct >= 0.0080) {
-            trailDist = 0.0025;
+        // Stage 3: Trend Runner (> +1.20% from cut) — Trail tightly 0.35% behind peak
+        if (profitPct >= 0.0120) {
+            trailDist = 0.0035;
             targetSL = currentPrice * (1 - trailDist);
         }
-        // Stage 2: Net Profit Lock (> +0.50% from cut) — Lock minimum +0.30% gain
-        else if (profitPct >= 0.0050) {
-            const minGuaranteed = cutPrice * 1.0030; // Cut + 0.30% pure profit
+        // Stage 2: Net Profit Lock (> +0.65% from cut) — Lock minimum +0.40% gain & arm Maker Limit TP @ +0.90%
+        else if (profitPct >= 0.0065) {
+            const minGuaranteed = cutPrice * 1.0040; // Cut + 0.40% pure profit
             const trailingCalc  = currentPrice * (1 - baseDist);
             targetSL = Math.max(minGuaranteed, trailingCalc);
+
+            // Place Post-Only Maker Limit TP @ +0.90% if not already placed
+            if (!activeLimitTPs[symbol]) {
+                const tpTargetPrice = cutPrice * 1.0090;
+                placeLimitTPOrder(symbol, 'Sell', tpTargetPrice, tradeQty, 1).then(id => {
+                    if (id) activeLimitTPs[symbol] = id;
+                });
+            }
         }
-        // Stage 1: Breakeven Arming (> +0.25% from cut) — Lock SL at Cut Price + fee buffer
-        else if (profitPct >= 0.0025) {
-            const breakevenSL   = cutPrice * 1.0005; // Cut + 0.05% fee buffer
+        // Stage 1: Breakeven Arming (> +0.35% from cut) — Lock SL at Cut Price + 0.10% (covers fees + profit)
+        else if (profitPct >= 0.0035) {
+            const breakevenSL   = cutPrice * 1.0010; // Cut + 0.10% buffer
             const trailingCalc  = currentPrice * (1 - baseDist);
             targetSL = Math.max(breakevenSL, trailingCalc);
         }
-        // Stall Guard: If trade stalls for > 35s without hitting +0.20%, arm breakeven
-        else if (elapsedSeconds > 35 && profitPct > 0) {
-            targetSL = cutPrice * 1.0002;
+        // Stall Guard: If trade stalls for > 40s without hitting +0.20%, arm breakeven
+        else if (elapsedSeconds > 40 && profitPct > 0) {
+            targetSL = cutPrice * 1.0005;
         }
         // Initial tight floor (capped at -0.35% from cut)
         else {
@@ -820,6 +870,7 @@ async function updateTrailingStop(symbol, currentPrice) {
         } else if (trade.trail_sl && currentPrice <= trade.trail_sl) {
             // ✅ Trail SL hit — close tradeQty of long reduce-only
             trailClosingFlags[symbol] = true;
+            await cancelActiveLimitTP(symbol); // Cancel any pending Limit TP
             console.log(`[PD] Long trail SL hit @ ${currentPrice.toFixed(4)} (SL was ${trade.trail_sl}). Closing ${tradeQty} long...`);
             db.prepare('UPDATE pump_dump_trades SET status=? WHERE symbol=?').run('closing', symbol);
             syncFromSQLite(db, 'pump_dump_trades', symbol);
@@ -849,26 +900,34 @@ async function updateTrailingStop(symbol, currentPrice) {
         let targetSL = 0;
         let trailDist = baseDist;
 
-        // Stage 3: Peak Harvest (> +0.80% from cut) — Trail tightly 0.25% behind peak
-        if (profitPct >= 0.0080) {
-            trailDist = 0.0025;
+        // Stage 3: Trend Runner (> +1.20% from cut) — Trail tightly 0.35% behind peak
+        if (profitPct >= 0.0120) {
+            trailDist = 0.0035;
             targetSL = currentPrice * (1 + trailDist);
         }
-        // Stage 2: Net Profit Lock (> +0.50% from cut) — Lock minimum +0.30% gain
-        else if (profitPct >= 0.0050) {
-            const minGuaranteed = cutPrice * 0.9970; // Cut - 0.30% pure profit
+        // Stage 2: Net Profit Lock (> +0.65% from cut) — Lock minimum +0.40% gain & arm Maker Limit TP @ +0.90%
+        else if (profitPct >= 0.0065) {
+            const minGuaranteed = cutPrice * 0.9960; // Cut - 0.40% pure profit
             const trailingCalc  = currentPrice * (1 + baseDist);
             targetSL = Math.min(minGuaranteed, trailingCalc);
+
+            // Place Post-Only Maker Limit TP @ +0.90% if not already placed
+            if (!activeLimitTPs[symbol]) {
+                const tpTargetPrice = cutPrice * 0.9910;
+                placeLimitTPOrder(symbol, 'Buy', tpTargetPrice, tradeQty, 2).then(id => {
+                    if (id) activeLimitTPs[symbol] = id;
+                });
+            }
         }
-        // Stage 1: Breakeven Arming (> +0.25% from cut) — Lock SL at Cut Price - fee buffer
-        else if (profitPct >= 0.0025) {
-            const breakevenSL   = cutPrice * 0.9995; // Cut - 0.05% fee buffer
+        // Stage 1: Breakeven Arming (> +0.35% from cut) — Lock SL at Cut Price - 0.10% (covers fees + profit)
+        else if (profitPct >= 0.0035) {
+            const breakevenSL   = cutPrice * 0.9990; // Cut - 0.10% buffer
             const trailingCalc  = currentPrice * (1 + baseDist);
             targetSL = Math.min(breakevenSL, trailingCalc);
         }
-        // Stall Guard: If trade stalls for > 35s without hitting +0.20%, arm breakeven
-        else if (elapsedSeconds > 35 && profitPct > 0) {
-            targetSL = cutPrice * 0.9998;
+        // Stall Guard: If trade stalls for > 40s without hitting +0.20%, arm breakeven
+        else if (elapsedSeconds > 40 && profitPct > 0) {
+            targetSL = cutPrice * 0.9995;
         }
         // Initial tight ceiling (capped at +0.35% from cut)
         else {
@@ -902,6 +961,7 @@ async function updateTrailingStop(symbol, currentPrice) {
         } else if (trade.trail_sl && currentPrice >= trade.trail_sl) {
             // ✅ Trail SL hit — close tradeQty of short reduce-only
             trailClosingFlags[symbol] = true;
+            await cancelActiveLimitTP(symbol); // Cancel any pending Limit TP
             console.log(`[PD] Short trail SL hit @ ${currentPrice.toFixed(4)} (SL was ${trade.trail_sl}). Closing ${tradeQty} short...`);
             db.prepare('UPDATE pump_dump_trades SET status=? WHERE symbol=?').run('closing', symbol);
             syncFromSQLite(db, 'pump_dump_trades', symbol);
@@ -1375,6 +1435,20 @@ function handlePrivateOrderUpdate(list) {
                            o.orderLinkId?.startsWith('tp-')    || o.orderLinkId?.startsWith('pd-');
         const isOpening  = o.reduceOnly === false || o.reduceOnly === 'false';
 
+        // ── Handle Maker Limit Take-Profit fills ──────────────
+        if (isFilled && o.orderLinkId?.startsWith('pd-tp-')) {
+            const trade = db.prepare('SELECT * FROM pump_dump_trades WHERE symbol = ?').get(symbol);
+            if (trade && (trade.status === 'trailing_long' || trade.status === 'trailing_short')) {
+                delete activeLimitTPs[symbol];
+                const fillPrice = parseFloat(o.avgPrice || o.price || 0);
+                console.log(`[TP] ✓ Maker Limit TP FILLED for ${symbol} @ ${fillPrice}! Finalizing trade cycle...`);
+                db.prepare('UPDATE pump_dump_trades SET status=? WHERE symbol=?').run('closing', symbol);
+                syncFromSQLite(db, 'pump_dump_trades', symbol);
+                await finalizeTradeAfterExit(symbol, trade, fillPrice);
+            }
+            return;
+        }
+
         if (isFilled && !isBotOrder && isOpening) {
             try {
                 const openPrice = parseFloat(o.avgPrice || o.price || lastValidPrice || 0);
@@ -1512,6 +1586,7 @@ io.on('connection', (socket) => {
     socket.on('stopTrading', async ({ symbol }) => {
         if (!symbol) return;
         delete symbolLocks[symbol];
+        await cancelActiveLimitTP(symbol);
         console.log(`[IO] Stop requested for ${symbol}`);
         try {
             db.transaction(() => {
@@ -1536,6 +1611,7 @@ io.on('connection', (socket) => {
     socket.on('closePositions', async ({ symbol }) => {
         if (!symbol) return;
         delete symbolLocks[symbol];
+        await cancelActiveLimitTP(symbol);
         console.log(`[IO] Close positions requested for ${symbol}`);
         try {
             db.transaction(() => {
