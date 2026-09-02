@@ -371,12 +371,12 @@ class SignalScorer {
             }
         }
 
-        // ── Signal 3: Orderbook imbalance ─────────────────
+        // ── Signal 3: Orderbook imbalance (2.0x Wall Dominance) ──
         const obTotal = this.obBidTotal + this.obAskTotal;
         if (obTotal > 0) {
             const bidRatio = this.obBidTotal / obTotal;
-            if (bidRatio > 0.65) { pump++; details.push({ s: 'OB', v: `${(bidRatio*100).toFixed(0)}% bid`, d: 'pump' }); }
-            if (bidRatio < 0.35) { dump++; details.push({ s: 'OB', v: `${((1-bidRatio)*100).toFixed(0)}% ask`, d: 'dump' }); }
+            if (bidRatio >= 0.67) { pump++; details.push({ s: 'OB Wall', v: `${(bidRatio*100).toFixed(0)}% bid`, d: 'pump' }); }
+            if (bidRatio <= 0.33) { dump++; details.push({ s: 'OB Wall', v: `${((1-bidRatio)*100).toFixed(0)}% ask`, d: 'dump' }); }
         }
 
         // ── Signal 4: Open Interest trend (60s) ───────────
@@ -575,31 +575,57 @@ async function checkCircuitBreaker(symbol, positions) {
     }
 }
 
-const symbolLocks = {}; // Per-symbol lock to prevent overlapping trade actions
+const symbolLocks  = {}; // Per-symbol lock to prevent overlapping trade actions
+const signalTimers = {}; // { [symbol]: { pumpStart: 0, dumpStart: 0 } }
+const SIGNAL_PERSIST_MS = 2500; // Must hold >= 5 for 2.5 seconds to confirm genuine breakout (filters 1s wick traps)
 
 async function handleSignalScore(symbol, pumpScore, dumpScore, currentPrice) {
     if (symbolLocks[symbol]) return;
     const trade = db.prepare('SELECT * FROM pump_dump_trades WHERE symbol = ?').get(symbol);
     if (!trade || trade.status !== 'hedged') return;
 
+    const now = Date.now();
+    if (!signalTimers[symbol]) signalTimers[symbol] = { pumpStart: 0, dumpStart: 0 };
+    const st = signalTimers[symbol];
+
+    // ── Check PUMP signal persistence ─────────────────────
     if (pumpScore >= SIGNAL_THRESHOLD) {
-        symbolLocks[symbol] = true;
-        console.log(`\x1b[32m[PD] 🚀 PUMP detected! ${symbol} score: ${pumpScore}/${SIGNAL_THRESHOLD}\x1b[0m`);
-        try {
-            await onPumpDetected(symbol, currentPrice, trade);
-        } catch (err) {
-            console.error('[PD] onPumpDetected error:', err.message);
-            symbolLocks[symbol] = false;
+        if (!st.pumpStart) st.pumpStart = now;
+        const elapsed = now - st.pumpStart;
+        if (elapsed >= SIGNAL_PERSIST_MS) {
+            st.pumpStart = 0; // reset
+            st.dumpStart = 0;
+            symbolLocks[symbol] = true;
+            console.log(`\x1b[32m[PD] 🚀 PUMP CONFIRMED (${(elapsed/1000).toFixed(1)}s hold)! ${symbol} score: ${pumpScore}/${SIGNAL_THRESHOLD}\x1b[0m`);
+            try {
+                await onPumpDetected(symbol, currentPrice, trade);
+            } catch (err) {
+                console.error('[PD] onPumpDetected error:', err.message);
+                symbolLocks[symbol] = false;
+            }
         }
-    } else if (dumpScore >= SIGNAL_THRESHOLD) {
-        symbolLocks[symbol] = true;
-        console.log(`\x1b[31m[PD] 📉 DUMP detected! ${symbol} score: ${dumpScore}/${SIGNAL_THRESHOLD}\x1b[0m`);
-        try {
-            await onDumpDetected(symbol, currentPrice, trade);
-        } catch (err) {
-            console.error('[PD] onDumpDetected error:', err.message);
-            symbolLocks[symbol] = false;
+    } else {
+        st.pumpStart = 0; // reset if dropped below threshold (fakeout filtered!)
+    }
+
+    // ── Check DUMP signal persistence ─────────────────────
+    if (dumpScore >= SIGNAL_THRESHOLD) {
+        if (!st.dumpStart) st.dumpStart = now;
+        const elapsed = now - st.dumpStart;
+        if (elapsed >= SIGNAL_PERSIST_MS) {
+            st.pumpStart = 0;
+            st.dumpStart = 0; // reset
+            symbolLocks[symbol] = true;
+            console.log(`\x1b[31m[PD] 📉 DUMP CONFIRMED (${(elapsed/1000).toFixed(1)}s hold)! ${symbol} score: ${dumpScore}/${SIGNAL_THRESHOLD}\x1b[0m`);
+            try {
+                await onDumpDetected(symbol, currentPrice, trade);
+            } catch (err) {
+                console.error('[PD] onDumpDetected error:', err.message);
+                symbolLocks[symbol] = false;
+            }
         }
+    } else {
+        st.dumpStart = 0; // reset if dropped below threshold (fakeout filtered!)
     }
 }
 
@@ -809,33 +835,33 @@ async function updateTrailingStop(symbol, currentPrice) {
         let targetSL = 0;
         let trailDist = baseDist;
 
-        // Stage 3: Trend Runner (> +1.20% from cut) — Trail tightly 0.35% behind peak
-        if (profitPct >= 0.0120) {
-            trailDist = 0.0035;
+        // Stage 3: Trend Runner (> +1.00% from cut) — Trail tightly 0.30% behind peak
+        if (profitPct >= 0.0100) {
+            trailDist = 0.0030;
             targetSL = currentPrice * (1 - trailDist);
         }
-        // Stage 2: Net Profit Lock (> +0.65% from cut) — Lock minimum +0.40% gain & arm Maker Limit TP @ +0.90%
-        else if (profitPct >= 0.0065) {
-            const minGuaranteed = cutPrice * 1.0040; // Cut + 0.40% pure profit
+        // Stage 2: Net Profit Lock (> +0.45% from cut) — Lock minimum +0.35% gain & arm Maker Limit TP @ +0.60%
+        else if (profitPct >= 0.0045) {
+            const minGuaranteed = cutPrice * 1.0035; // Cut + 0.35% pure profit
             const trailingCalc  = currentPrice * (1 - baseDist);
             targetSL = Math.max(minGuaranteed, trailingCalc);
 
-            // Place Post-Only Maker Limit TP @ +0.90% if not already placed
+            // Place Post-Only Maker Limit TP @ +0.60% if not already placed
             if (!activeLimitTPs[symbol]) {
-                const tpTargetPrice = cutPrice * 1.0090;
+                const tpTargetPrice = cutPrice * 1.0060;
                 placeLimitTPOrder(symbol, 'Sell', tpTargetPrice, tradeQty, 1).then(id => {
                     if (id) activeLimitTPs[symbol] = id;
                 });
             }
         }
-        // Stage 1: Breakeven Arming (> +0.35% from cut) — Lock SL at Cut Price + 0.10% (covers fees + profit)
-        else if (profitPct >= 0.0035) {
+        // Stage 1: Breakeven Arming (> +0.25% from cut) — Lock SL at Cut Price + 0.10% (covers fees + profit)
+        else if (profitPct >= 0.0025) {
             const breakevenSL   = cutPrice * 1.0010; // Cut + 0.10% buffer
             const trailingCalc  = currentPrice * (1 - baseDist);
             targetSL = Math.max(breakevenSL, trailingCalc);
         }
-        // Stall Guard: If trade stalls for > 40s without hitting +0.20%, arm breakeven
-        else if (elapsedSeconds > 40 && profitPct > 0) {
+        // Stall Guard: If trade stalls for > 35s without hitting +0.20%, arm breakeven
+        else if (elapsedSeconds > 35 && profitPct > 0) {
             targetSL = cutPrice * 1.0005;
         }
         // Initial tight floor (capped at -0.35% from cut)
@@ -900,33 +926,33 @@ async function updateTrailingStop(symbol, currentPrice) {
         let targetSL = 0;
         let trailDist = baseDist;
 
-        // Stage 3: Trend Runner (> +1.20% from cut) — Trail tightly 0.35% behind peak
-        if (profitPct >= 0.0120) {
-            trailDist = 0.0035;
+        // Stage 3: Trend Runner (> +1.00% from cut) — Trail tightly 0.30% behind peak
+        if (profitPct >= 0.0100) {
+            trailDist = 0.0030;
             targetSL = currentPrice * (1 + trailDist);
         }
-        // Stage 2: Net Profit Lock (> +0.65% from cut) — Lock minimum +0.40% gain & arm Maker Limit TP @ +0.90%
-        else if (profitPct >= 0.0065) {
-            const minGuaranteed = cutPrice * 0.9960; // Cut - 0.40% pure profit
+        // Stage 2: Net Profit Lock (> +0.45% from cut) — Lock minimum +0.35% gain & arm Maker Limit TP @ +0.60%
+        else if (profitPct >= 0.0045) {
+            const minGuaranteed = cutPrice * 0.9965; // Cut - 0.35% pure profit
             const trailingCalc  = currentPrice * (1 + baseDist);
             targetSL = Math.min(minGuaranteed, trailingCalc);
 
-            // Place Post-Only Maker Limit TP @ +0.90% if not already placed
+            // Place Post-Only Maker Limit TP @ +0.60% if not already placed
             if (!activeLimitTPs[symbol]) {
-                const tpTargetPrice = cutPrice * 0.9910;
+                const tpTargetPrice = cutPrice * 0.9940;
                 placeLimitTPOrder(symbol, 'Buy', tpTargetPrice, tradeQty, 2).then(id => {
                     if (id) activeLimitTPs[symbol] = id;
                 });
             }
         }
-        // Stage 1: Breakeven Arming (> +0.35% from cut) — Lock SL at Cut Price - 0.10% (covers fees + profit)
-        else if (profitPct >= 0.0035) {
+        // Stage 1: Breakeven Arming (> +0.25% from cut) — Lock SL at Cut Price - 0.10% (covers fees + profit)
+        else if (profitPct >= 0.0025) {
             const breakevenSL   = cutPrice * 0.9990; // Cut - 0.10% buffer
             const trailingCalc  = currentPrice * (1 + baseDist);
             targetSL = Math.min(breakevenSL, trailingCalc);
         }
-        // Stall Guard: If trade stalls for > 40s without hitting +0.20%, arm breakeven
-        else if (elapsedSeconds > 40 && profitPct > 0) {
+        // Stall Guard: If trade stalls for > 35s without hitting +0.20%, arm breakeven
+        else if (elapsedSeconds > 35 && profitPct > 0) {
             targetSL = cutPrice * 0.9995;
         }
         // Initial tight ceiling (capped at +0.35% from cut)
@@ -1107,6 +1133,46 @@ async function recoverStuckTrades() {
             deleteDoc('active_trades', trade.symbol);
         }
     }
+}
+
+// ─── Balanced Hedge Opening Engine ───────────────────────
+async function openHedgePositions(symbol, price, info) {
+    const minOrderQty = parseFloat(info?.lotSizeFilter?.minOrderQty || 1);
+    const qtyStep     = parseFloat(info?.lotSizeFilter?.qtyStep || minOrderQty);
+    const dec         = getDecimalPlaces(qtyStep);
+
+    // Calculate 100.00% exact identical size for both Long and Short
+    const rawQty   = (HEDGE_MARGIN_USDT * HEDGE_LEVERAGE) / price;
+    const exactQty = parseFloat((Math.floor(rawQty / qtyStep) * qtyStep).toFixed(dec));
+    const finalQty = Math.max(exactQty, minOrderQty);
+    const qtyStr   = finalQty.toFixed(dec);
+
+    console.log(`[Hedge Engine] Opening 100% identical hedge for ${symbol}: ${qtyStr} Long & ${qtyStr} Short (${HEDGE_MARGIN_USDT} USDT margin @ ${HEDGE_LEVERAGE}x)...`);
+
+    // Set leverage on Bybit
+    await apiRequest('/v5/position/set-leverage', {
+        category: 'linear', symbol,
+        buyLeverage: HEDGE_LEVERAGE.toString(),
+        sellLeverage: HEDGE_LEVERAGE.toString()
+    }, 'POST').catch(() => {});
+
+    // Open Long (Buy, positionIdx: 1) and Short (Sell, positionIdx: 2) with EXACT same size
+    const [longRes, shortRes] = await Promise.all([
+        apiRequest('/v5/order/create', {
+            category: 'linear', symbol, side: 'Buy', orderType: 'Market',
+            qty: qtyStr, timeInForce: 'GTC', positionIdx: 1,
+            orderLinkId: `hedge-long-${Date.now()}-${symbol}`
+        }, 'POST'),
+        apiRequest('/v5/order/create', {
+            category: 'linear', symbol, side: 'Sell', orderType: 'Market',
+            qty: qtyStr, timeInForce: 'GTC', positionIdx: 2,
+            orderLinkId: `hedge-short-${Date.now()}-${symbol}`
+        }, 'POST')
+    ]);
+
+    console.log('[Hedge Engine] Long order response:', JSON.stringify(longRes));
+    console.log('[Hedge Engine] Short order response:', JSON.stringify(shortRes));
+    return finalQty;
 }
 
 // ─── Manual Leg Hedge Engine (existing) ───────────────────
