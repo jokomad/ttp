@@ -558,7 +558,19 @@
 
     <!-- ── Signal Gauge Card ──────────────────────────── -->
     <div class="card" id="signal-card">
-        <div class="card-label">Signal Detector  <span style="color:var(--blue); float:right; font-size:0.85em;">threshold: 4 / 7</span></div>
+        <div class="card-label">Signal Detector  <span style="color:var(--blue); float:right; font-size:0.85em;">threshold: 5 / 7</span></div>
+        
+        <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+            <div style="flex:1; background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:8px; padding:6px 10px; display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-size:0.7em; color:var(--muted); text-transform:uppercase;">OFI (Top-5 Depth)</span>
+                <span id="metric-ofi" style="font-size:0.82em; font-family:'JetBrains Mono',monospace; font-weight:700; color:var(--text);">0.0%</span>
+            </div>
+            <div style="flex:1; background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:8px; padding:6px 10px; display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-size:0.7em; color:var(--muted); text-transform:uppercase;">CVD Delta (30s)</span>
+                <span id="metric-cvd" style="font-size:0.82em; font-family:'JetBrains Mono',monospace; font-weight:700; color:var(--text);">0.0%</span>
+            </div>
+        </div>
+
         <div class="gauge-grid">
             <div class="gauge-box gauge-pump" id="gauge-pump">
                 <div class="gauge-head">
@@ -678,10 +690,25 @@
         renderPriceCard(data);
     });
 
-    socket.on('signalUpdate', ({ symbol, pump, dump, details, maxSignals }) => {
+    socket.on('signalUpdate', ({ symbol, pump, dump, details, maxSignals, ofi, cvdDelta }) => {
         if (symbol !== currentSymbol) return;
         updateGauge('pump', pump, maxSignals, pump >= 5);
         updateGauge('dump', dump, maxSignals, dump >= 5);
+        
+        const ofiEl = document.getElementById('metric-ofi');
+        if (ofiEl && ofi !== undefined) {
+            const ofiNum = parseFloat(ofi);
+            ofiEl.textContent = `${ofiNum >= 0 ? '+' : ''}${ofi}%`;
+            ofiEl.style.color = ofiNum >= 35 ? 'var(--green)' : ofiNum <= -35 ? 'var(--red)' : 'var(--text)';
+        }
+
+        const cvdEl = document.getElementById('metric-cvd');
+        if (cvdEl && cvdDelta !== undefined) {
+            const cvdNum = parseFloat(cvdDelta);
+            cvdEl.textContent = `${cvdNum >= 0 ? '+' : ''}${cvdDelta}%`;
+            cvdEl.style.color = cvdNum >= 25 ? 'var(--green)' : cvdNum <= -25 ? 'var(--red)' : 'var(--text)';
+        }
+
         const tagsEl = document.getElementById('signal-tags');
         tagsEl.innerHTML = details.map(d =>
             `<span class="sig-tag sig-tag-${d.d}">${d.s}: ${d.v}</span>`
