@@ -275,11 +275,7 @@ class SignalScorer {
         this.lastLiqClear = Date.now();
         this.klineBody    = 0;   // abs body pct of current 1m candle
         this.klineDir     = 0;   // +1 bullish, -1 bearish
-        // BB breakout state — tracks whether price is persistently outside a band
-        // direction: 'up' | 'down' | null
-        // startTime: when the breakout was first detected (ms)
-        // initDist:  how far outside the band price was at first detection
-        this.bbState     = { direction: null, startTime: 0, initDist: 0 };
+        this.bbState      = { direction: null, startTime: 0, initDist: 0 };
     }
 
     getVolatility() {
@@ -295,7 +291,7 @@ class SignalScorer {
     updatePrice(price) {
         const now = Date.now();
         this.priceHistory.push({ time: now, price });
-        const cutoff = now - 120_000;  // keep 2 min so BB always has 20 samples
+        const cutoff = now - 120_000;
         this.priceHistory = this.priceHistory.filter(p => p.time >= cutoff);
     }
 
@@ -323,7 +319,6 @@ class SignalScorer {
     }
 
     updateLiquidation(side, qty) {
-        // 'Buy' = short position liquidated (bullish), 'Sell' = long position liquidated (bearish)
         const now = Date.now();
         if (now - this.lastLiqClear > 15_000) {
             this.shortLiqVol  = 0;
@@ -340,6 +335,37 @@ class SignalScorer {
         this.klineDir  = body >= 0 ? 1 : -1;
     }
 
+    // Quantitative OFI: Top-5 Depth Imbalance (-1.0 to +1.0)
+    computeOFI() {
+        const ob = obState[this.symbol];
+        if (!ob || ob.bids.size === 0 || ob.asks.size === 0) return 0;
+        
+        const bidPrices = [...ob.bids.keys()].map(Number).sort((a, b) => b - a).slice(0, 5);
+        const askPrices = [...ob.asks.keys()].map(Number).sort((a, b) => a - b).slice(0, 5);
+
+        let bidDepth = 0;
+        bidPrices.forEach(p => { bidDepth += (ob.bids.get(p.toString()) || ob.bids.get(p) || 0); });
+
+        let askDepth = 0;
+        askPrices.forEach(p => { askDepth += (ob.asks.get(p.toString()) || ob.asks.get(p) || 0); });
+
+        const totalDepth = bidDepth + askDepth;
+        if (totalDepth === 0) return 0;
+        return (bidDepth - askDepth) / totalDepth; // +1.0 (pure bid) to -1.0 (pure ask)
+    }
+
+    // Quantitative Cumulative Volume Delta (CVD) in rolling window
+    computeCVD(windowMs = 30_000) {
+        const now = Date.now();
+        const recent = this.tradeHistory.filter(t => now - t.time <= windowMs);
+        const buyVol  = recent.reduce((s, t) => s + t.buyVol, 0);
+        const sellVol = recent.reduce((s, t) => s + t.sellVol, 0);
+        const total   = buyVol + sellVol;
+        const netDelta = buyVol - sellVol;
+        const deltaPct = total > 0 ? (netDelta / total) : 0;
+        return { buyVol, sellVol, netDelta, deltaPct };
+    }
+
     compute() {
         const now  = Date.now();
         let pump = 0, dump = 0;
@@ -350,33 +376,30 @@ class SignalScorer {
         const cur   = this.priceHistory[this.priceHistory.length - 1];
         if (old30 && cur) {
             const vel = (cur.price - old30.price) / old30.price * 100;
-            if (vel >  0.5) { pump++; details.push({ s: 'Velocity', v: `+${vel.toFixed(2)}%`, d: 'pump' }); }
-            if (vel < -0.5) { dump++; details.push({ s: 'Velocity', v: `${vel.toFixed(2)}%`,  d: 'dump' }); }
+            if (vel >  0.45) { pump++; details.push({ s: 'Velocity', v: `+${vel.toFixed(2)}%`, d: 'pump' }); }
+            if (vel < -0.45) { dump++; details.push({ s: 'Velocity', v: `${vel.toFixed(2)}%`,  d: 'dump' }); }
         }
 
-        // ── Signal 2: Volume spike + direction (30s) ──────
-        const recent = this.tradeHistory.filter(t => now - t.time < 30_000);
-        const base   = this.tradeHistory.filter(t => now - t.time >= 30_000 && now - t.time < 120_000);
-        const recentVol  = recent.reduce((s, t) => s + t.buyVol + t.sellVol, 0);
-        const baseTotal  = base.reduce((s, t) => s + t.buyVol + t.sellVol, 0);
-        const baseAvg30s = base.length > 0 ? baseTotal * (30_000 / 90_000) : 0; // scale to 30s
-
-        if (baseAvg30s > 0 && recentVol > baseAvg30s * 2) {
-            const bv = recent.reduce((s, t) => s + t.buyVol,  0);
-            const sv = recent.reduce((s, t) => s + t.sellVol, 0);
-            const tv = bv + sv;
-            if (tv > 0) {
-                if (bv / tv > 0.60) { pump++; details.push({ s: 'Volume', v: `${(bv/tv*100).toFixed(0)}% buy`,  d: 'pump' }); }
-                if (sv / tv > 0.60) { dump++; details.push({ s: 'Volume', v: `${(sv/tv*100).toFixed(0)}% sell`, d: 'dump' }); }
+        // ── Signal 2: CVD Volume Delta (30s window) ───────────
+        const cvd = this.computeCVD(30_000);
+        if (cvd.buyVol + cvd.sellVol > 0) {
+            if (cvd.deltaPct >= 0.25) { 
+                pump++; 
+                details.push({ s: 'CVD Buy', v: `+${(cvd.deltaPct*100).toFixed(0)}%`, d: 'pump' }); 
+            } else if (cvd.deltaPct <= -0.25) { 
+                dump++; 
+                details.push({ s: 'CVD Sell', v: `${(cvd.deltaPct*100).toFixed(0)}%`, d: 'dump' }); 
             }
         }
 
-        // ── Signal 3: Orderbook imbalance (2.0x Wall Dominance) ──
-        const obTotal = this.obBidTotal + this.obAskTotal;
-        if (obTotal > 0) {
-            const bidRatio = this.obBidTotal / obTotal;
-            if (bidRatio >= 0.67) { pump++; details.push({ s: 'OB Wall', v: `${(bidRatio*100).toFixed(0)}% bid`, d: 'pump' }); }
-            if (bidRatio <= 0.33) { dump++; details.push({ s: 'OB Wall', v: `${((1-bidRatio)*100).toFixed(0)}% ask`, d: 'dump' }); }
+        // ── Signal 3: Quantitative Order Flow Imbalance (OFI Top-5 Depth) ──
+        const ofi = this.computeOFI();
+        if (ofi >= 0.35) {
+            pump++;
+            details.push({ s: 'OFI Bid', v: `+${(ofi*100).toFixed(0)}%`, d: 'pump' });
+        } else if (ofi <= -0.35) {
+            dump++;
+            details.push({ s: 'OFI Ask', v: `${(ofi*100).toFixed(0)}%`, d: 'dump' });
         }
 
         // ── Signal 4: Open Interest trend (60s) ───────────
@@ -399,14 +422,7 @@ class SignalScorer {
         }
 
         // ── Signal 7: Bollinger Band confirmed breakout (20 samples, 2σ) ──
-        //
-        // Two-phase filter to avoid fakeouts:
-        //  Phase 1 — Detection: price first crosses outside the band → timestamp it.
-        //  Phase 2 — Confirmation: price must stay outside for ≥ BB_CONFIRM_MS (4s)
-        //            AND must not have significantly retraced back toward the band
-        //            (remaining distance ≥ 30% of the initial breakout distance).
-        //  Reset: if price re-enters the band at any point, state clears immediately.
-        const BB_CONFIRM_MS     = 4_000;   // 4 seconds outside band required
+        const BB_CONFIRM_MS     = 3_000;   // 3 seconds outside band required
         const BB_RETRACE_FLOOR  = 0.30;    // must keep ≥ 30% of initial distance
 
         if (this.priceHistory.length >= 10) {
@@ -421,13 +437,10 @@ class SignalScorer {
             const bandPct  = stdDev > 0 ? ((2 * stdDev) / sma * 100).toFixed(3) : '0.000';
 
             if (latest > upper) {
-                // Price is above upper band
                 const dist = latest - upper;
                 if (this.bbState.direction !== 'up') {
-                    // Phase 1: new breakout — record the moment and initial distance
                     this.bbState = { direction: 'up', startTime: now, initDist: dist };
                 } else {
-                    // Phase 2: already in an 'up' breakout — check persistence & continuation
                     const elapsed   = now - this.bbState.startTime;
                     const notFaded  = dist >= this.bbState.initDist * BB_RETRACE_FLOOR;
                     if (elapsed >= BB_CONFIRM_MS && notFaded) {
@@ -435,17 +448,13 @@ class SignalScorer {
                         pump++;
                         details.push({ s: 'BB✓', v: `>${bandPct}% · ${secs}s`, d: 'pump' });
                     }
-                    // update initDist to follow the furthest point (ratchet outward)
                     if (dist > this.bbState.initDist) this.bbState.initDist = dist;
                 }
             } else if (latest < lower) {
-                // Price is below lower band
                 const dist = lower - latest;
                 if (this.bbState.direction !== 'down') {
-                    // Phase 1: new breakout
                     this.bbState = { direction: 'down', startTime: now, initDist: dist };
                 } else {
-                    // Phase 2: persistence & continuation check
                     const elapsed   = now - this.bbState.startTime;
                     const notFaded  = dist >= this.bbState.initDist * BB_RETRACE_FLOOR;
                     if (elapsed >= BB_CONFIRM_MS && notFaded) {
@@ -456,14 +465,21 @@ class SignalScorer {
                     if (dist > this.bbState.initDist) this.bbState.initDist = dist;
                 }
             } else {
-                // Price returned inside the bands — fakeout, reset state
                 if (this.bbState.direction !== null) {
                     this.bbState = { direction: null, startTime: 0, initDist: 0 };
                 }
             }
         }
 
-        return { pump, dump, details, maxSignals: 7 };
+        // Divergence veto: If CVD is actively conflicting, suppress signal
+        if (pump >= 4 && cvd.deltaPct < -0.15) {
+            pump = Math.max(0, pump - 2); // Veto false pump on negative CVD
+        }
+        if (dump >= 4 && cvd.deltaPct > 0.15) {
+            dump = Math.max(0, dump - 2); // Veto false dump on positive CVD
+        }
+
+        return { pump, dump, details, maxSignals: 7, ofi: (ofi * 100).toFixed(1), cvdDelta: (cvd.deltaPct * 100).toFixed(1) };
     }
 }
 
@@ -473,19 +489,19 @@ function getOrCreateScorer(symbol) {
     return signalScorers[symbol];
 }
 
-// Score every 2s and optionally fire pump/dump action
+// Score every 1.5s and optionally fire pump/dump action
 setInterval(() => {
     if (!wsSymbol) return;
     const scorer = signalScorers[wsSymbol];
     if (!scorer) return;
-    const { pump, dump, details, maxSignals } = scorer.compute();
-    io.emit('signalUpdate', { symbol: wsSymbol, pump, dump, details, maxSignals });
+    const { pump, dump, details, maxSignals, ofi, cvdDelta } = scorer.compute();
+    io.emit('signalUpdate', { symbol: wsSymbol, pump, dump, details, maxSignals, ofi, cvdDelta });
     if (lastValidPrice !== null) {
         handleSignalScore(wsSymbol, pump, dump, lastValidPrice).catch(err =>
             console.error('[Signal] Error in handleSignalScore:', err.message)
         );
     }
-}, 2000);
+}, 1500);
 
 // ─── Orderbook State Manager ──────────────────────────────
 const obState = {};   // symbol → { bids: Map<price, qty>, asks: Map<price, qty> }
@@ -518,34 +534,6 @@ function getBestBidAsk(symbol) {
 }
 
 // ─── Pump/Dump Trade Functions ─────────────────────────────
-
-async function openHedgePositions(symbol, price, info) {
-    const qty = getPositionQtyForMargin(price, info);
-    console.log(`[PD] Opening ${HEDGE_MARGIN_USDT} USDT margin hedge (${HEDGE_LEVERAGE}× = ${HEDGE_MARGIN_USDT * HEDGE_LEVERAGE} USDT notional) — qty: ${qty} ${info.baseCoin} @ ~${price}`);
-
-    await apiRequest('/v5/position/switch-mode', { category: 'linear', symbol, mode: 3 }, 'POST').catch(() => {});
-    await apiRequest('/v5/position/set-leverage', {
-        category: 'linear', symbol,
-        buyLeverage:  HEDGE_LEVERAGE.toString(),
-        sellLeverage: HEDGE_LEVERAGE.toString()
-    }, 'POST').catch(() => {});
-
-    const longRes  = await apiRequest('/v5/order/create', {
-        category: 'linear', symbol, side: 'Buy', orderType: 'Market',
-        qty: qty.toString(), timeInForce: 'GTC', positionIdx: 1,
-        orderLinkId: `pd-long-${Date.now()}-${symbol}`
-    }, 'POST');
-    console.log('[PD] Long open:', JSON.stringify(longRes));
-
-    const shortRes = await apiRequest('/v5/order/create', {
-        category: 'linear', symbol, side: 'Sell', orderType: 'Market',
-        qty: qty.toString(), timeInForce: 'GTC', positionIdx: 2,
-        orderLinkId: `pd-short-${Date.now()}-${symbol}`
-    }, 'POST');
-    console.log('[PD] Short open:', JSON.stringify(shortRes));
-
-    return qty;
-}
 
 
 let isEmergencyClosing = false;
@@ -675,29 +663,25 @@ function calculateDynamicParams(symbol, currentPrice, direction, trade) {
         console.error('[Stats] Error querying trade history:', e.message);
     }
 
-    // 2. Compute dynamic initial trail distance
-    // We want trail distance >= 1.8x live standard deviation (so noise doesn't stop us out)
-    // and adapted to ~50% of historical average expansion if available.
     const volNoiseFloor = liveVol * 1.8;
     const histTarget    = avgHistoricalPeakPct > 0 ? avgHistoricalPeakPct * 0.5 : 0.006;
     let initialTrailPct = Math.max(volNoiseFloor, histTarget, TRAIL_INITIAL_PCT);
-    
-    // Clamp between 0.4% and 2.5%
     initialTrailPct = Math.min(Math.max(initialTrailPct, 0.004), 0.025);
 
-    // Tightened trail is ~60% of initial trail
     const tightTrailPct = Math.max(initialTrailPct * 0.6, TRAIL_TIGHT_PCT);
 
-    // 3. Trade Sizing:
-    // Uses exchange minimum order quantity
+    // Multi-tier trade sizing: 2 * minOrderQty to allow 2-tier scale out (Tier 1 Limit TP + Tier 2 Runner)
     const minQty   = parseFloat(info.lotSizeFilter.minOrderQty);
     const qtyDec   = getDecimals(info.lotSizeFilter.qtyStep);
-    const tradeQty = parseFloat(minQty.toFixed(qtyDec));
+    let tradeQty = parseFloat((minQty * 2).toFixed(qtyDec));
+    if (tradeQty > trade.qty * 0.5) tradeQty = parseFloat(minQty.toFixed(qtyDec)); // safety cap
 
     return {
         initialTrailPct,
         tightTrailPct,
         tradeQty,
+        minQty,
+        qtyDec,
         liveVolPct: (liveVol * 100).toFixed(2),
         histAvgPct: (avgHistoricalPeakPct * 100).toFixed(2)
     };
@@ -710,8 +694,7 @@ async function onPumpDetected(symbol, currentPrice, trade) {
 
     const dyn = calculateDynamicParams(symbol, currentPrice, 'long', trade);
     const tradeQty = dyn.tradeQty;
-    // Cap initial stop loss leash at -0.20% max (Pure Maker floor)
-    const initialTrail = 0.0020;
+    const initialTrail = 0.0020; // 0.20% initial floor
 
     // Get top of orderbook for zero-friction Maker Cut
     const { bestBid } = getBestBidAsk(symbol);
@@ -723,7 +706,6 @@ async function onPumpDetected(symbol, currentPrice, trade) {
     // Initial dynamic trail SL price (-0.20% from cut price)
     const trailSLPrice = parseFloat((Math.floor(limitCutPrice * (1 - initialTrail) / tickSize) * tickSize).toFixed(dec));
 
-    // For this trailing cycle, record long_entry as limitCutPrice (the cut price baseline)
     db.prepare(`UPDATE pump_dump_trades SET status=?, trail_direction=?, trail_peak=?, trail_distance=?, trail_sl=?, cut_pnl=?, trade_qty=?, long_entry=?, created_at=? WHERE symbol=?`)
         .run('trailing_long', 'long', limitCutPrice, initialTrail, trailSLPrice, cutPnl, tradeQty, limitCutPrice, Date.now(), symbol);
     emitPdTradeUpdate(symbol);
@@ -738,7 +720,6 @@ async function onPumpDetected(symbol, currentPrice, trade) {
     }, 'POST').catch(() => null);
 
     if (!closeRes || closeRes.retCode !== 0) {
-        // Fallback to Market IOC if Post-Only crosses spread during rapid movement
         closeRes = await apiRequest('/v5/order/create', {
             category: 'linear', symbol, side: 'Buy', orderType: 'Market',
             qty: tradeQty.toString(), timeInForce: 'IOC', positionIdx: 2,
@@ -748,18 +729,19 @@ async function onPumpDetected(symbol, currentPrice, trade) {
 
     console.log(`[PD] Maker Cut ${tradeQty} short @ ${limitCutPrice} (0% fee):`, JSON.stringify(closeRes));
 
-    // 2. Immediately place Maker Limit Take-Profit at +0.50%
-    const tpTargetPrice = limitCutPrice * 1.0050;
-    placeLimitTPOrder(symbol, 'Sell', tpTargetPrice, tradeQty, 1).then(id => {
-        if (id) activeLimitTPs[symbol] = id;
+    // 2. Multi-Tier Exits: Place Tier 1 Maker TP at +0.35% (half of slice or minOrderQty)
+    const tier1Qty = (tradeQty > dyn.minQty) ? parseFloat((tradeQty / 2).toFixed(dyn.qtyDec)) : tradeQty;
+    const tpTargetPrice = limitCutPrice * 1.0035; // +0.35% Maker TP
+    placeLimitTPOrder(symbol, 'Sell', tpTargetPrice, tier1Qty, 1).then(id => {
+        if (id) activeLimitTPs[symbol] = { orderId: id, qty: tier1Qty };
     });
 
     io.emit('signalEvent', {
         symbol, type: 'PUMP',
-        message: `🚀 PUMP! Maker Cut ${tradeQty} short @ ${limitCutPrice.toFixed(4)} (0% Fee). Maker TP @ ${(tpTargetPrice).toFixed(4)} (+0.50%) | SL: ${trailSLPrice} (-0.20%)`,
+        message: `🚀 PUMP! Maker Cut ${tradeQty} short @ ${limitCutPrice.toFixed(4)} (0% Fee). Tier 1 TP (${tier1Qty}) @ ${(tpTargetPrice).toFixed(4)} (+0.35%) | Tier 2 Runner Trail | SL: ${trailSLPrice} (-0.20%)`,
         ts: Date.now()
     });
-    console.log(`[PD] Trailing long (qty=${tradeQty}). Maker Cut Baseline: ${limitCutPrice}, TP: ${tpTargetPrice.toFixed(4)}, SL: ${trailSLPrice}`);
+    console.log(`[PD] Trailing long (qty=${tradeQty}). Cut: ${limitCutPrice}, Tier 1 TP: ${tpTargetPrice.toFixed(4)}, SL: ${trailSLPrice}`);
 }
 
 async function onDumpDetected(symbol, currentPrice, trade) {
@@ -769,7 +751,6 @@ async function onDumpDetected(symbol, currentPrice, trade) {
 
     const dyn = calculateDynamicParams(symbol, currentPrice, 'short', trade);
     const tradeQty = dyn.tradeQty;
-    // Cap initial stop loss leash at -0.20% max (Pure Maker floor)
     const initialTrail = 0.0020;
 
     // Get top of orderbook for zero-friction Maker Cut
@@ -782,7 +763,6 @@ async function onDumpDetected(symbol, currentPrice, trade) {
     // Initial dynamic trail SL price (-0.20% ceiling from cut price)
     const trailSLPrice = parseFloat((Math.ceil(limitCutPrice * (1 + initialTrail) / tickSize) * tickSize).toFixed(dec));
 
-    // For this trailing cycle, record short_entry as limitCutPrice (the cut price baseline)
     db.prepare(`UPDATE pump_dump_trades SET status=?, trail_direction=?, trail_peak=?, trail_distance=?, trail_sl=?, cut_pnl=?, trade_qty=?, short_entry=?, created_at=? WHERE symbol=?`)
         .run('trailing_short', 'short', limitCutPrice, initialTrail, trailSLPrice, cutPnl, tradeQty, limitCutPrice, Date.now(), symbol);
     emitPdTradeUpdate(symbol);
@@ -797,7 +777,6 @@ async function onDumpDetected(symbol, currentPrice, trade) {
     }, 'POST').catch(() => null);
 
     if (!closeRes || closeRes.retCode !== 0) {
-        // Fallback to Market IOC if Post-Only crosses spread during rapid movement
         closeRes = await apiRequest('/v5/order/create', {
             category: 'linear', symbol, side: 'Sell', orderType: 'Market',
             qty: tradeQty.toString(), timeInForce: 'IOC', positionIdx: 1,
@@ -807,26 +786,25 @@ async function onDumpDetected(symbol, currentPrice, trade) {
 
     console.log(`[PD] Maker Cut ${tradeQty} long @ ${limitCutPrice} (0% fee):`, JSON.stringify(closeRes));
 
-    // 2. Immediately place Maker Limit Take-Profit at +0.50%
-    const tpTargetPrice = limitCutPrice * 0.9950;
-    placeLimitTPOrder(symbol, 'Buy', tpTargetPrice, tradeQty, 2).then(id => {
-        if (id) activeLimitTPs[symbol] = id;
+    // 2. Multi-Tier Exits: Place Tier 1 Maker TP at +0.35% (half of slice or minOrderQty)
+    const tier1Qty = (tradeQty > dyn.minQty) ? parseFloat((tradeQty / 2).toFixed(dyn.qtyDec)) : tradeQty;
+    const tpTargetPrice = limitCutPrice * 0.9965; // +0.35% Maker TP
+    placeLimitTPOrder(symbol, 'Buy', tpTargetPrice, tier1Qty, 2).then(id => {
+        if (id) activeLimitTPs[symbol] = { orderId: id, qty: tier1Qty };
     });
 
     io.emit('signalEvent', {
         symbol, type: 'DUMP',
-        message: `📉 DUMP! Maker Cut ${tradeQty} long @ ${limitCutPrice.toFixed(4)} (0% Fee). Maker TP @ ${(tpTargetPrice).toFixed(4)} (+0.50%) | SL: ${trailSLPrice} (-0.20%)`,
+        message: `📉 DUMP! Maker Cut ${tradeQty} long @ ${limitCutPrice.toFixed(4)} (0% Fee). Tier 1 TP (${tier1Qty}) @ ${(tpTargetPrice).toFixed(4)} (+0.35%) | Tier 2 Runner Trail | SL: ${trailSLPrice} (-0.20%)`,
         ts: Date.now()
     });
-    console.log(`[PD] Trailing short (qty=${tradeQty}). Maker Cut Baseline: ${limitCutPrice}, TP: ${tpTargetPrice.toFixed(4)}, SL: ${trailSLPrice}`);
+    console.log(`[PD] Trailing short (qty=${tradeQty}). Cut: ${limitCutPrice}, Tier 1 TP: ${tpTargetPrice.toFixed(4)}, SL: ${trailSLPrice}`);
 }
 
 // Trailing stop manager — called on every price tick
-// Trailing stop manager — called on every price tick
-// Server-managed: detects SL breach and fires reduce-only minQty market order.
 const lastTrailUpdate   = {};
 const trailClosingFlags = {};  // prevents duplicate close orders per symbol
-const activeLimitTPs    = {};  // symbol → orderId for Stage 2 Maker Limit TP
+const activeLimitTPs    = {};  // symbol → { orderId, qty } for Stage 1 Maker Limit TP
 
 async function placeLimitTPOrder(symbol, side, price, qty, positionIdx) {
     try {
@@ -861,7 +839,8 @@ async function placeLimitTPOrder(symbol, side, price, qty, positionIdx) {
 
 async function cancelActiveLimitTP(symbol) {
     if (activeLimitTPs[symbol]) {
-        const orderId = activeLimitTPs[symbol];
+        const item = activeLimitTPs[symbol];
+        const orderId = typeof item === 'object' ? item.orderId : item;
         delete activeLimitTPs[symbol];
         await apiRequest('/v5/order/cancel', { category: 'linear', symbol, orderId }, 'POST').catch(() => {});
     }
@@ -870,7 +849,7 @@ async function cancelActiveLimitTP(symbol) {
 async function updateTrailingStop(symbol, currentPrice) {
     const trade = db.prepare('SELECT * FROM pump_dump_trades WHERE symbol = ?').get(symbol);
     if (!trade || (trade.status !== 'trailing_long' && trade.status !== 'trailing_short')) return;
-    if (trailClosingFlags[symbol]) return;  // already firing the trail close order
+    if (trailClosingFlags[symbol]) return;
 
     const now      = Date.now();
     const info     = cachedInstrumentInfo[symbol];
@@ -881,7 +860,6 @@ async function updateTrailingStop(symbol, currentPrice) {
     const elapsedSeconds = trade.created_at ? (now - trade.created_at) / 1000 : 0;
 
     if (trade.trail_direction === 'long') {
-        // ── Long trail (benchmarked from cut baseline) ──────────────────────
         const cutPrice  = trade.long_entry > 0 ? trade.long_entry : currentPrice;
         const profitPct = cutPrice > 0 ? (currentPrice - cutPrice) / cutPrice : 0;
         const baseDist  = trade.trail_distance || 0.0035;
@@ -889,25 +867,25 @@ async function updateTrailingStop(symbol, currentPrice) {
         let targetSL = 0;
         let trailDist = baseDist;
 
-        // Stage 3: Trend Runner (> +0.80% from cut) — Trail tightly 0.25% behind peak
-        if (profitPct >= 0.0080) {
+        // Stage 3: Trend Runner (> +0.60% from cut) — Trail tightly 0.25% behind peak
+        if (profitPct >= 0.0060) {
             trailDist = 0.0025;
             targetSL = currentPrice * (1 - trailDist);
         }
-        // Stage 2: Net Profit Lock (> +0.35% from cut) — Lock minimum +0.25% pure gain
-        else if (profitPct >= 0.0035) {
-            const minGuaranteed = cutPrice * 1.0025; // Cut + 0.25% pure profit
+        // Stage 2: Net Profit Lock (> +0.30% from cut) — Lock minimum +0.20% pure gain
+        else if (profitPct >= 0.0030) {
+            const minGuaranteed = cutPrice * 1.0020;
             const trailingCalc  = currentPrice * (1 - baseDist);
             targetSL = Math.max(minGuaranteed, trailingCalc);
         }
-        // Stage 1: Breakeven Arming (> +0.20% from cut) — Lock SL at Cut Price + 0.05% (covers all fees)
-        else if (profitPct >= 0.0020) {
-            const breakevenSL   = cutPrice * 1.0005; // Cut + 0.05% buffer
+        // Stage 1: Breakeven Arming (> +0.15% from cut) — Lock SL at Cut Price + 0.03%
+        else if (profitPct >= 0.0015) {
+            const breakevenSL   = cutPrice * 1.0003;
             const trailingCalc  = currentPrice * (1 - baseDist);
             targetSL = Math.max(breakevenSL, trailingCalc);
         }
-        // Stall Guard: If trade stalls for > 30s without hitting +0.15%, arm breakeven
-        else if (elapsedSeconds > 30 && profitPct > 0) {
+        // Stall Guard: If trade stalls for > 25s without hitting +0.15%, arm breakeven
+        else if (elapsedSeconds > 25 && profitPct > 0) {
             targetSL = cutPrice * 1.0002;
         }
         // Initial tight floor (capped at -0.20% from cut)
@@ -918,7 +896,6 @@ async function updateTrailingStop(symbol, currentPrice) {
         const newSL = parseFloat((Math.floor(targetSL / tickSize) * tickSize).toFixed(dec));
 
         if (currentPrice > (trade.trail_peak || 0)) {
-            // New peak — record peak and advance SL
             if (!trade.trail_sl || newSL > trade.trail_sl) {
                 if (!lastTrailUpdate[symbol] || now - lastTrailUpdate[symbol] >= 500) {
                     lastTrailUpdate[symbol] = now;
@@ -930,7 +907,6 @@ async function updateTrailingStop(symbol, currentPrice) {
                 }
             }
         } else if (!trade.trail_sl || newSL > trade.trail_sl) {
-            // Ratchet SL upward even between peaks if stage upgrade occurs
             if (!lastTrailUpdate[symbol] || now - lastTrailUpdate[symbol] >= 500) {
                 lastTrailUpdate[symbol] = now;
                 db.prepare('UPDATE pump_dump_trades SET trail_sl=?, trail_distance=? WHERE symbol=?')
@@ -940,9 +916,8 @@ async function updateTrailingStop(symbol, currentPrice) {
                 console.log(`\x1b[32m[Trail] Long SL Ratcheted: SL=${newSL} (Move=+${(profitPct*100).toFixed(2)}%)\x1b[0m`);
             }
         } else if (trade.trail_sl && currentPrice <= trade.trail_sl) {
-            // ✅ Trail SL hit — close tradeQty of long reduce-only
             trailClosingFlags[symbol] = true;
-            await cancelActiveLimitTP(symbol); // Cancel any pending Limit TP
+            await cancelActiveLimitTP(symbol);
             console.log(`[PD] Long trail SL hit @ ${currentPrice.toFixed(4)} (SL was ${trade.trail_sl}). Closing ${tradeQty} long...`);
             db.prepare('UPDATE pump_dump_trades SET status=? WHERE symbol=?').run('closing', symbol);
             syncFromSQLite(db, 'pump_dump_trades', symbol);
@@ -964,7 +939,6 @@ async function updateTrailingStop(symbol, currentPrice) {
         }
 
     } else if (trade.trail_direction === 'short') {
-        // ── Short trail (benchmarked from cut baseline) ─────────────────────
         const cutPrice  = trade.short_entry > 0 ? trade.short_entry : currentPrice;
         const profitPct = cutPrice > 0 ? (cutPrice - currentPrice) / cutPrice : 0;
         const baseDist  = trade.trail_distance || 0.0035;
@@ -972,25 +946,25 @@ async function updateTrailingStop(symbol, currentPrice) {
         let targetSL = 0;
         let trailDist = baseDist;
 
-        // Stage 3: Trend Runner (> +0.80% from cut) — Trail tightly 0.25% behind peak
-        if (profitPct >= 0.0080) {
+        // Stage 3: Trend Runner (> +0.60% from cut) — Trail tightly 0.25% behind peak
+        if (profitPct >= 0.0060) {
             trailDist = 0.0025;
             targetSL = currentPrice * (1 + trailDist);
         }
-        // Stage 2: Net Profit Lock (> +0.35% from cut) — Lock minimum +0.25% pure gain
-        else if (profitPct >= 0.0035) {
-            const minGuaranteed = cutPrice * 0.9975; // Cut - 0.25% pure profit
+        // Stage 2: Net Profit Lock (> +0.30% from cut) — Lock minimum +0.20% pure gain
+        else if (profitPct >= 0.0030) {
+            const minGuaranteed = cutPrice * 0.9980;
             const trailingCalc  = currentPrice * (1 + baseDist);
             targetSL = Math.min(minGuaranteed, trailingCalc);
         }
-        // Stage 1: Breakeven Arming (> +0.20% from cut) — Lock SL at Cut Price - 0.05% (covers all fees)
-        else if (profitPct >= 0.0020) {
-            const breakevenSL   = cutPrice * 0.9995; // Cut - 0.05% buffer
+        // Stage 1: Breakeven Arming (> +0.15% from cut) — Lock SL at Cut Price - 0.03%
+        else if (profitPct >= 0.0015) {
+            const breakevenSL   = cutPrice * 0.9997;
             const trailingCalc  = currentPrice * (1 + baseDist);
             targetSL = Math.min(breakevenSL, trailingCalc);
         }
-        // Stall Guard: If trade stalls for > 30s without hitting +0.15%, arm breakeven
-        else if (elapsedSeconds > 30 && profitPct > 0) {
+        // Stall Guard: If trade stalls for > 25s without hitting +0.15%, arm breakeven
+        else if (elapsedSeconds > 25 && profitPct > 0) {
             targetSL = cutPrice * 0.9998;
         }
         // Initial tight ceiling (capped at +0.20% from cut)
@@ -1001,7 +975,6 @@ async function updateTrailingStop(symbol, currentPrice) {
         const newSL = parseFloat((Math.ceil(targetSL / tickSize) * tickSize).toFixed(dec));
 
         if (currentPrice < (trade.trail_peak || Infinity)) {
-            // New low — record peak and advance SL downward
             if (!trade.trail_sl || newSL < trade.trail_sl) {
                 if (!lastTrailUpdate[symbol] || now - lastTrailUpdate[symbol] >= 500) {
                     lastTrailUpdate[symbol] = now;
@@ -1013,7 +986,6 @@ async function updateTrailingStop(symbol, currentPrice) {
                 }
             }
         } else if (!trade.trail_sl || newSL < trade.trail_sl) {
-            // Ratchet SL downward even between peaks if stage upgrade occurs
             if (!lastTrailUpdate[symbol] || now - lastTrailUpdate[symbol] >= 500) {
                 lastTrailUpdate[symbol] = now;
                 db.prepare('UPDATE pump_dump_trades SET trail_sl=?, trail_distance=? WHERE symbol=?')
@@ -1023,9 +995,8 @@ async function updateTrailingStop(symbol, currentPrice) {
                 console.log(`\x1b[31m[Trail] Short SL Ratcheted: SL=${newSL} (Move=+${(profitPct*100).toFixed(2)}%)\x1b[0m`);
             }
         } else if (trade.trail_sl && currentPrice >= trade.trail_sl) {
-            // ✅ Trail SL hit — close tradeQty of short reduce-only
             trailClosingFlags[symbol] = true;
-            await cancelActiveLimitTP(symbol); // Cancel any pending Limit TP
+            await cancelActiveLimitTP(symbol);
             console.log(`[PD] Short trail SL hit @ ${currentPrice.toFixed(4)} (SL was ${trade.trail_sl}). Closing ${tradeQty} short...`);
             db.prepare('UPDATE pump_dump_trades SET status=? WHERE symbol=?').run('closing', symbol);
             syncFromSQLite(db, 'pump_dump_trades', symbol);
@@ -1173,43 +1144,69 @@ async function recoverStuckTrades() {
     }
 }
 
-// ─── Balanced Hedge Opening Engine ───────────────────────
+// ─── Balanced Pure Maker Hedge Opening Engine ───────────────────────
 async function openHedgePositions(symbol, price, info) {
     const minOrderQty = parseFloat(info?.lotSizeFilter?.minOrderQty || 1);
     const qtyStep     = parseFloat(info?.lotSizeFilter?.qtyStep || minOrderQty);
-    const dec         = getDecimalPlaces(qtyStep);
+    const tickSize    = parseFloat(info?.priceFilter?.tickSize || 0.0001);
+    const qtyDec      = getDecimalPlaces(qtyStep);
+    const priceDec    = getDecimalPlaces(tickSize);
 
     // Calculate 100.00% exact identical size for both Long and Short
     const rawQty   = (HEDGE_MARGIN_USDT * HEDGE_LEVERAGE) / price;
-    const exactQty = parseFloat((Math.floor(rawQty / qtyStep) * qtyStep).toFixed(dec));
+    const exactQty = parseFloat((Math.floor(rawQty / qtyStep) * qtyStep).toFixed(qtyDec));
     const finalQty = Math.max(exactQty, minOrderQty);
-    const qtyStr   = finalQty.toFixed(dec);
+    const qtyStr   = finalQty.toFixed(qtyDec);
 
-    console.log(`[Hedge Engine] Opening 100% identical hedge for ${symbol}: ${qtyStr} Long & ${qtyStr} Short (${HEDGE_MARGIN_USDT} USDT margin @ ${HEDGE_LEVERAGE}x)...`);
+    console.log(`[Hedge Engine] Opening 100% pure maker dual hedge for ${symbol}: ${qtyStr} Long & ${qtyStr} Short (${HEDGE_MARGIN_USDT} USDT margin @ ${HEDGE_LEVERAGE}x)...`);
 
     // Set leverage on Bybit
+    await apiRequest('/v5/position/switch-mode', { category: 'linear', symbol, mode: 3 }, 'POST').catch(() => {});
     await apiRequest('/v5/position/set-leverage', {
         category: 'linear', symbol,
         buyLeverage: HEDGE_LEVERAGE.toString(),
         sellLeverage: HEDGE_LEVERAGE.toString()
     }, 'POST').catch(() => {});
 
-    // Open Long (Buy, positionIdx: 1) and Short (Sell, positionIdx: 2) with EXACT same size
+    // Retrieve live top of book for zero-spread maker entry
+    const { bestBid, bestAsk } = getBestBidAsk(symbol);
+    const bidPriceStr = (bestBid ? parseFloat(bestBid) : price).toFixed(priceDec);
+    const askPriceStr = (bestAsk ? parseFloat(bestAsk) : price).toFixed(priceDec);
+
+    console.log(`[Hedge Engine] Quoting Maker Limit orders: Long @ ${bidPriceStr} (Bid), Short @ ${askPriceStr} (Ask)`);
+
+    // Place Post-Only Maker orders on both sides
     const [longRes, shortRes] = await Promise.all([
         apiRequest('/v5/order/create', {
-            category: 'linear', symbol, side: 'Buy', orderType: 'Market',
-            qty: qtyStr, timeInForce: 'GTC', positionIdx: 1,
+            category: 'linear', symbol, side: 'Buy', orderType: 'Limit',
+            price: bidPriceStr, qty: qtyStr, timeInForce: 'PostOnly', positionIdx: 1,
             orderLinkId: `hedge-long-${Date.now()}-${symbol}`
         }, 'POST'),
         apiRequest('/v5/order/create', {
-            category: 'linear', symbol, side: 'Sell', orderType: 'Market',
-            qty: qtyStr, timeInForce: 'GTC', positionIdx: 2,
+            category: 'linear', symbol, side: 'Sell', orderType: 'Limit',
+            price: askPriceStr, qty: qtyStr, timeInForce: 'PostOnly', positionIdx: 2,
             orderLinkId: `hedge-short-${Date.now()}-${symbol}`
         }, 'POST')
     ]);
 
-    console.log('[Hedge Engine] Long order response:', JSON.stringify(longRes));
-    console.log('[Hedge Engine] Short order response:', JSON.stringify(shortRes));
+    // If PostOnly rejects (market crossed), fallback to immediate market fill
+    if (longRes.retCode !== 0) {
+        console.warn('[Hedge Engine] Long PostOnly rejected, filling as market IOC...');
+        await apiRequest('/v5/order/create', {
+            category: 'linear', symbol, side: 'Buy', orderType: 'Market',
+            qty: qtyStr, timeInForce: 'IOC', positionIdx: 1,
+            orderLinkId: `hedge-long-mkt-${Date.now()}-${symbol}`
+        }, 'POST');
+    }
+    if (shortRes.retCode !== 0) {
+        console.warn('[Hedge Engine] Short PostOnly rejected, filling as market IOC...');
+        await apiRequest('/v5/order/create', {
+            category: 'linear', symbol, side: 'Sell', orderType: 'Market',
+            qty: qtyStr, timeInForce: 'IOC', positionIdx: 2,
+            orderLinkId: `hedge-short-mkt-${Date.now()}-${symbol}`
+        }, 'POST');
+    }
+
     return finalQty;
 }
 
